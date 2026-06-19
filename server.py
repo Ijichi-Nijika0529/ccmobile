@@ -612,6 +612,14 @@ $('vk-row-mod').querySelectorAll('.mod').forEach(b => {
     vkMod[b.dataset.mod] = !vkMod[b.dataset.mod];
     vkUpdateModUI();
     log('VK', b.dataset.mod + '=' + vkMod[b.dataset.mod]);
+    // shift+tab: send immediately, don't wait for letter
+    if (vkMod.shift && vkMod.vt) {
+      wsSend('\x1b[Z');
+      vkMod.shift = false;
+      vkMod.vt = false;
+      vkUpdateModUI();
+      log('VK', 'shift+tab sent');
+    }
   });
 });
 
