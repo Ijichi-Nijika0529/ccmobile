@@ -297,6 +297,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 .vk-mod-ctrl.on{background:#58a6ff;color:#fff;outline:2px solid #80bfff}
 .vk-mod-alt.on{background:#bc8cff;color:#fff;outline:2px solid #d2a8ff}
 .vk-mod-shift.on{background:#3fb950;color:#fff;outline:2px solid #70d970}
+.vk-mod-tab{background:#1a3c3c;color:#56d4dd}
+.vk-mod-tab.on{background:#56d4dd;color:#000;outline:2px solid #80e8e8}
 .vk-btn.sym{background:#1a2a1a;color:#7ee787}
 .vk-btn.special{background:#1a1a2e;color:#a0a0d0}
 #btn-kbd{background:var(--warn);color:#000}
@@ -343,6 +345,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
       <button class="vk-btn mod vk-mod-ctrl" data-mod="ctrl">Ctrl</button>
       <button class="vk-btn mod vk-mod-alt" data-mod="alt">Alt</button>
       <button class="vk-btn mod vk-mod-shift" data-mod="shift">Shift</button>
+      <button class="vk-btn mod vk-mod-tab" data-mod="vt">Tab</button>
       <span style="flex:1;min-width:4px"></span>
       <button class="vk-btn special" data-key="esc">Esc</button>
       <button class="vk-btn special" data-key="tab">Tab</button>
@@ -576,7 +579,7 @@ $('btn-esc').addEventListener('click', () => wsSend('\x1b'));
 $('btn-kill').addEventListener('click', () => { if (ws) ws.close(); log('KILL', 'forced'); });
 
 // ── virtual keyboard ──
-const vkMod = { ctrl: false, alt: false, shift: false };
+const vkMod = { ctrl: false, alt: false, shift: false, vt: false };
 const KEY_MAP = {
   esc: '\x1b', tab: '\t', spc: ' ', bs: '\x7f', enter: '\r',
   home: '\x1b[H', end: '\x1b[F', pgup: '\x1b[5~', pgdn: '\x1b[6~', del: '\x1b[3~',
@@ -594,9 +597,12 @@ function vkSend(key) {
   if (data !== undefined) { wsSend(data); return; }
   if (!/[a-z]/i.test(key)) return;
   const lower = key.toLowerCase(), code = lower.charCodeAt(0);
-  if (vkMod.ctrl) { wsSend(String.fromCharCode(code - 96)); vkMod.ctrl = false; }
-  else if (vkMod.alt) { wsSend('\x1b' + lower); vkMod.alt = false; }
-  else if (vkMod.shift) { wsSend(key.toUpperCase()); vkMod.shift = false; }
+  let prefix = '';
+  if (vkMod.vt) { prefix = '\t'; vkMod.vt = false; }
+  if (vkMod.ctrl) { wsSend(prefix + String.fromCharCode(code - 96)); vkMod.ctrl = false; }
+  else if (vkMod.alt) { wsSend(prefix + '\x1b' + lower); vkMod.alt = false; }
+  else if (vkMod.shift) { wsSend(prefix + key.toUpperCase()); vkMod.shift = false; }
+  else if (prefix) { wsSend(prefix + lower); }
   vkUpdateModUI();
 }
 
