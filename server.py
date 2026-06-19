@@ -59,6 +59,9 @@ async def spawn_claude() -> int:
 
     pid, fd = pty.fork()
     if pid == 0:
+        # clear sensitive env vars before exec
+        for k in ("CCMOBILE_PASSWORD", "CCMOBILE_ACCOUNTS"):
+            os.environ.pop(k, None)
         os.chdir(WORKDIR)
         os.execvp("claude", ["claude"])
         os._exit(127)
@@ -110,22 +113,47 @@ async def handle_index(request: web.Request) -> web.Response:
     return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
 
 
+def _get_token(request: web.Request) -> str:
+    """Read token from cookie first, fallback to query param."""
+    return request.cookies.get("ccmobile_token", "") or request.query.get("token", "")
+
+
+def _check_origin(request: web.Request) -> bool:
+    """Allow if no Origin header, or if Origin matches Host."""
+    origin = request.headers.get("Origin", "")
+    if not origin:
+        return True
+    host = request.headers.get("Host", "")
+    # extract host:port from origin URL
+    try:
+        origin_host = origin.split("://", 1)[1] if "://" in origin else origin
+    except (IndexError, ValueError):
+        return False
+    return origin_host == host
+
+
 async def handle_login(request: web.Request) -> web.Response:
     if not PASSWORD:
-        return web.json_response({"token": make_token(), "expires": TOKEN_EXPIRE})
-    try:
-        body = await request.json()
-        pw = body.get("password", "")
-    except (json.JSONDecodeError, AttributeError):
-        return web.json_response({"error": "bad request"}, status=400)
-    if pw != PASSWORD:
-        await asyncio.sleep(1)
-        return web.json_response({"error": "wrong password"}, status=403)
-    return web.json_response({"token": make_token(), "expires": TOKEN_EXPIRE})
+        token = make_token()
+        resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
+    else:
+        try:
+            body = await request.json()
+            pw = body.get("password", "")
+        except (json.JSONDecodeError, AttributeError):
+            return web.json_response({"error": "bad request"}, status=400)
+        if pw != PASSWORD:
+            await asyncio.sleep(1)
+            return web.json_response({"error": "wrong password"}, status=403)
+        token = make_token()
+        resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
+    resp.set_cookie("ccmobile_token", token, max_age=TOKEN_EXPIRE,
+                    httponly=True, samesite="Strict", secure=False)
+    return resp
 
 
 async def handle_check(request: web.Request) -> web.Response:
-    token = request.query.get("token", "")
+    token = _get_token(request)
     if not PASSWORD:
         return web.json_response({"valid": True})
     return web.json_response({"valid": check_token(token)})
@@ -134,7 +162,12 @@ async def handle_check(request: web.Request) -> web.Response:
 # ── WebSocket handler ────────────────────────────────────────────────
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
-    token = request.query.get("token", "")
+    if not _check_origin(request):
+        peer = request.remote or "?"
+        print(f"[ws] {peer} bad origin: {request.headers.get('Origin', '?')}")
+        return await _ws_error(request, "origin not allowed")
+
+    token = _get_token(request)
     peer = request.remote or "?"
     print(f"[ws] connect from {peer}")
 
@@ -375,7 +408,7 @@ window.onerror = (msg, src, line) => {
   log('JS ERROR', msg + ' at ' + (src||'?').split('/').pop() + ':' + line);
 };
 
-let token = localStorage.getItem('ccmobile_token') || '';
+let authenticated = false;
 let ws = null, term = null, fit = null, byteCount = 0;
 
 const $ = id => document.getElementById(id);
@@ -395,8 +428,7 @@ async function tryLogin(pw) {
   });
   const data = await res.json();
   if (res.ok) {
-    token = data.token;
-    localStorage.setItem('ccmobile_token', token);
+    authenticated = true;
     log('AUTH', 'OK, expires in ' + data.expires + 's');
     return true;
   }
@@ -404,8 +436,7 @@ async function tryLogin(pw) {
 }
 
 async function checkToken() {
-  if (!token) return false;
-  const res = await fetch('/check?token=' + encodeURIComponent(token));
+  const res = await fetch('/check');
   const data = await res.json();
   log('AUTH', 'token check: ' + data.valid);
   return data.valid;
@@ -460,7 +491,7 @@ function setStatus(on, text) {
 
 function connectWS() {
   return new Promise((resolve, reject) => {
-    const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws?token=' + encodeURIComponent(token);
+    const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws';
     log('WS', 'connecting...');
     try { ws = new WebSocket(url); } catch(e) { log('WS', 'FAIL: '+e.message); reject(e); return; }
     ws.binaryType = 'arraybuffer';
@@ -627,8 +658,7 @@ $('btn-kbd').addEventListener('click', () => {
 
 $('logout-btn').addEventListener('click', () => {
   if (ws) ws.close();
-  localStorage.removeItem('ccmobile_token');
-  token = '';
+  authenticated = false;
   mainScreen.style.display = 'none';
   loginScreen.style.display = 'flex';
   setStatus(false, 'offline');
@@ -653,9 +683,8 @@ function showMain() {
 }
 
 (async function init() {
-  if (token && await checkToken()) { showMain(); return; }
-  token = '';
-  localStorage.removeItem('ccmobile_token');
+  if (await checkToken()) { authenticated = true; showMain(); return; }
+  authenticated = false;
   loginScreen.style.display = 'flex';
   log('UI', 'login screen');
 })();
