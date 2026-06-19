@@ -17,16 +17,37 @@ from aiohttp import web
 # ── config ──────────────────────────────────────────────────────────
 PORT = int(os.environ.get("CCMOBILE_PORT", "8765"))
 PASSWORD = os.environ.get("CCMOBILE_PASSWORD", "")
-WORKDIR = os.environ.get("CCMOBILE_WORKDIR", str(Path.home()))
+_WORKDIR = os.environ.get("CCMOBILE_WORKDIR", "")
+WORKDIR = str(Path(_WORKDIR).resolve()) if _WORKDIR else str(Path.home())
 TOKEN_EXPIRE = int(os.environ.get("CCMOBILE_TOKEN_EXPIRE", "86400"))
+WS_MSG_MAX = 1_048_576       # 1MB max per WebSocket message
+WS_IDLE_TIMEOUT = 1800        # 30min idle → close
+LOGIN_RATE_LIMIT = 5          # max attempts per window
+LOGIN_RATE_WINDOW = 60        # seconds
 
 _secret = secrets.token_hex(32)
+
+# rate limiter: {ip: [(ts1, ts2, ...)]}
+_rate_log: dict[str, list[float]] = {}
+_rate_lock = asyncio.Lock()
 
 
 # ── token helpers ────────────────────────────────────────────────────
 
 def _hash_token(ts: str) -> str:
-    return hashlib.sha256(f"{PASSWORD}:{ts}:{_secret}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"{PASSWORD}:{ts}:{_secret}".encode()).hexdigest()
+
+
+async def _check_rate(ip: str) -> bool:
+    """Returns True if within rate limit, False if exceeded."""
+    now = time.time()
+    async with _rate_lock:
+        window = [t for t in _rate_log.get(ip, []) if now - t < LOGIN_RATE_WINDOW]
+        if len(window) >= LOGIN_RATE_LIMIT:
+            return False
+        window.append(now)
+        _rate_log[ip] = window
+        return True
 
 
 def make_token() -> str:
@@ -133,6 +154,12 @@ def _check_origin(request: web.Request) -> bool:
 
 
 async def handle_login(request: web.Request) -> web.Response:
+    peer = request.remote or "?"
+    if PASSWORD and not await _check_rate(peer):
+        print(f"[login] {peer} rate limited")
+        await asyncio.sleep(2)
+        return web.json_response({"error": "too many attempts"}, status=429)
+
     if not PASSWORD:
         token = make_token()
         resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
@@ -142,7 +169,8 @@ async def handle_login(request: web.Request) -> web.Response:
             pw = body.get("password", "")
         except (json.JSONDecodeError, AttributeError):
             return web.json_response({"error": "bad request"}, status=400)
-        if pw != PASSWORD:
+        # timing-safe comparison
+        if not secrets.compare_digest(pw, PASSWORD):
             await asyncio.sleep(1)
             return web.json_response({"error": "wrong password"}, status=403)
         token = make_token()
@@ -190,7 +218,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             return await _ws_error(request, "claude CLI not found")
         except Exception as e:
             print(f"[ws] {peer} spawn error: {e}")
-            return await _ws_error(request, str(e))
+            return await _ws_error(request, "Failed to start Claude Code")
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -229,14 +257,15 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
         try:
             async for msg in ws:
-                if msg.type == web.WSMsgType.TEXT:
-                    msg_count += 1
-                    os.write(fd, msg.data.encode())
-                elif msg.type == web.WSMsgType.BINARY:
-                    msg_count += 1
-                    os.write(fd, msg.data)
-                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                     break
+                data = msg.data
+                if isinstance(data, str):
+                    data = data.encode()
+                if len(data) > WS_MSG_MAX:
+                    continue
+                msg_count += 1
+                os.write(fd, data)
         finally:
             print(f"[ws] {peer} session end ({msg_count} msgs, {byte_count} bytes)")
             reader_task.cancel()
