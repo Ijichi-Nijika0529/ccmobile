@@ -25,21 +25,23 @@ _secret = secrets.token_hex(32)
 
 # ── token helpers ────────────────────────────────────────────────────
 
+def _hash_token(ts: str) -> str:
+    return hashlib.sha256(f"{PASSWORD}:{ts}:{_secret}".encode()).hexdigest()[:32]
+
+
 def make_token() -> str:
     ts = str(int(time.time()))
-    h = hashlib.sha256(f"{PASSWORD}:{ts}:{_secret}".encode()).hexdigest()[:32]
-    return f"{ts}:{h}"
+    return f"{ts}:{_hash_token(ts)}"
 
 
 def check_token(token: str) -> bool:
     if not token:
         return False
     try:
-        ts_str, _ = token.split(":", 1)
+        ts_str, h = token.split(":", 2)[:2]
         if time.time() - int(ts_str) > TOKEN_EXPIRE:
             return False
-        expected = hashlib.sha256(f"{PASSWORD}:{ts_str}:{_secret}".encode()).hexdigest()[:32]
-        return secrets.compare_digest(token.split(":", 2)[1], expected)
+        return secrets.compare_digest(h, _hash_token(ts_str))
     except (ValueError, AttributeError):
         return False
 
@@ -67,33 +69,38 @@ async def spawn_claude() -> int:
         return fd
 
 
+def _safe(fn, *args):
+    """Call fn, ignore OSError. Returns True if no exception."""
+    try:
+        fn(*args)
+        return True
+    except OSError:
+        return False
+
+
+async def _ws_error(request: web.Request, msg: str) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    await ws.send_str(json.dumps({"type": "error", "msg": msg}))
+    await ws.close()
+    return ws
+
+
 async def kill_claude():
     global _claude_pid, _claude_fd
     pid, fd = _claude_pid, _claude_fd
 
     if fd is not None:
-        try:
-            os.write(fd, b"\x04")
-            await asyncio.sleep(0.5)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        _safe(os.write, fd, b"\x04")
+        await asyncio.sleep(0.5)
+        _safe(os.close, fd)
         _claude_fd = None
 
     if pid is not None:
-        try:
-            os.kill(pid, 15)
-            await asyncio.sleep(0.3)
-            os.kill(pid, 9)
-        except OSError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
+        _safe(os.kill, pid, 15)
+        await asyncio.sleep(0.3)
+        _safe(os.kill, pid, 9)
+        _safe(os.waitpid, pid, 0)
         _claude_pid = None
 
 
@@ -133,39 +140,27 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     if PASSWORD and not check_token(token):
         print(f"[ws] {peer} bad token")
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.send_str(json.dumps({"type": "error", "msg": "invalid token"}))
-        await ws.close()
-        return ws
+        return await _ws_error(request, "invalid token")
 
     if _lock.locked():
         print(f"[ws] {peer} rejected - lock held")
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.send_str(json.dumps({"type": "error", "msg": "Claude Code is already running"}))
-        await ws.close()
-        return ws
+        return await _ws_error(request, "Claude Code is already running")
 
     async with _lock:
         await kill_claude()
         print(f"[ws] {peer} spawning Claude...")
 
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
         try:
             fd = await spawn_claude()
         except FileNotFoundError:
             print(f"[ws] {peer} claude not found")
-            await ws.send_str(json.dumps({"type": "error", "msg": "claude CLI not found"}))
-            await ws.close()
-            return ws
+            return await _ws_error(request, "claude CLI not found")
         except Exception as e:
             print(f"[ws] {peer} spawn error: {e}")
-            await ws.send_str(json.dumps({"type": "error", "msg": str(e)}))
-            await ws.close()
-            return ws
+            return await _ws_error(request, str(e))
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
 
         print(f"[ws] {peer} Claude PID={_claude_pid} fd={fd}")
         await ws.send_str(json.dumps({"type": "ready"}))
@@ -253,9 +248,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 #login-screen{display:none;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:24px;gap:20px}
 #login-screen h1{font-size:22px;font-weight:600}
 #login-screen input{width:100%;max-width:320px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;outline:none}
-#login-screen input:focus{border-color:var(--accent)}
+#login-screen input:focus,#input-row input:focus{border-color:var(--accent)}
 #login-btn{padding:12px 28px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;width:100%;max-width:320px}
-#login-btn:active{opacity:.7}
 #login-error{color:var(--danger);font-size:14px;min-height:20px}
 #main-screen{display:none;flex-direction:column;height:100%}
 #status-bar{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:var(--surface);border-bottom:1px solid var(--border);font-size:11px;flex-shrink:0}
@@ -271,25 +265,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 #start-overlay{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:var(--bg);gap:12px}
 #start-overlay p{font-size:13px;color:var(--text);opacity:.6}
 #start-btn{padding:16px 36px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}
-#start-btn:active{opacity:.7}
 #toolbar{display:flex;gap:4px;padding:6px 8px;background:var(--surface);border-top:1px solid var(--border);flex-shrink:0;justify-content:center;flex-wrap:wrap}
 .tb-btn{padding:8px 10px;font-size:12px;border-radius:6px;text-align:center;border:none;font-weight:600;cursor:pointer;color:#fff}
-.tb-btn:active{opacity:.7}
 .tb-accent{background:var(--accent)}
 .tb-danger{background:var(--danger)}
 .tb-gray{background:var(--border);color:var(--text)}
 .tb-enter{background:var(--green);flex:2;max-width:120px}
 #input-row{display:flex;gap:4px;padding:4px 8px 8px;background:var(--surface);flex-shrink:0}
 #input-row input{flex:1;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none;min-width:0}
-#input-row input:focus{border-color:var(--accent)}
 #send-btn{padding:10px 16px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;flex-shrink:0}
-#send-btn:active{opacity:.7}
 #debug-panel{display:none;background:#000;color:var(--warn);font-size:10px;padding:4px 8px;max-height:80px;overflow-y:auto;flex-shrink:0;font-family:monospace;border-top:1px solid var(--border)}
+#login-btn:active,#start-btn:active,.tb-btn:active,#send-btn:active,.vk-btn:active{opacity:.7}
 /* virtual keyboard */
 #vk-panel{display:none;flex-shrink:0;background:var(--surface);border-top:1px solid var(--border);padding:3px 4px;max-height:45vh;overflow-y:auto}
 .vk-row{display:flex;gap:2px;justify-content:center;flex-wrap:wrap;margin:1px 0}
 .vk-btn{min-width:26px;height:30px;padding:3px 5px;font-size:11px;border-radius:4px;border:none;font-weight:600;cursor:pointer;color:var(--text);background:var(--border);text-align:center;line-height:24px}
-.vk-btn:active{opacity:.7}
 .vk-btn.mod{min-width:42px;font-size:10px;border-radius:5px}
 .vk-mod-ctrl{background:#1a3a5c;color:#58a6ff}
 .vk-mod-alt{background:#2d1a3c;color:#bc8cff}
@@ -328,15 +318,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     </div>
   </div>
   <div id="toolbar">
-    <button class="tb-btn tb-enter" id="btn-enter">Enter &crarr;</button>
-    <button class="tb-btn tb-accent" id="btn-c">^C</button>
-    <button class="tb-btn tb-accent" id="btn-d">^D</button>
-    <button class="tb-btn tb-gray" id="btn-left">&larr;</button>
-    <button class="tb-btn tb-gray" id="btn-up">&uarr;</button>
-    <button class="tb-btn tb-gray" id="btn-down">&darr;</button>
-    <button class="tb-btn tb-gray" id="btn-right">&rarr;</button>
-    <button class="tb-btn tb-gray" id="btn-tab">Tab</button>
-    <button class="tb-btn tb-gray" id="btn-esc">Esc</button>
+    <button class="tb-btn tb-enter" id="btn-enter" data-ws="\r">Enter &crarr;</button>
+    <button class="tb-btn tb-accent" id="btn-c" data-ws="\x03">^C</button>
+    <button class="tb-btn tb-accent" id="btn-d" data-ws="\x04">^D</button>
+    <button class="tb-btn tb-gray" id="btn-left" data-ws="\x1b[D">&larr;</button>
+    <button class="tb-btn tb-gray" id="btn-up" data-ws="\x1b[A">&uarr;</button>
+    <button class="tb-btn tb-gray" id="btn-down" data-ws="\x1b[B">&darr;</button>
+    <button class="tb-btn tb-gray" id="btn-right" data-ws="\x1b[C">&rarr;</button>
+    <button class="tb-btn tb-gray" id="btn-tab" data-ws="\t">Tab</button>
+    <button class="tb-btn tb-gray" id="btn-esc" data-ws="\x1b">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
@@ -358,15 +348,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
       <button class="vk-btn special" data-key="pgdn">Pd</button>
       <button class="vk-btn special" data-key="del">Del</button>
     </div>
-    <div class="vk-row" id="vk-row-q1">
-      <button class="vk-btn" data-key="q">Q</button><button class="vk-btn" data-key="w">W</button><button class="vk-btn" data-key="e">E</button><button class="vk-btn" data-key="r">R</button><button class="vk-btn" data-key="t">T</button><button class="vk-btn" data-key="y">Y</button><button class="vk-btn" data-key="u">U</button><button class="vk-btn" data-key="i">I</button><button class="vk-btn" data-key="o">O</button><button class="vk-btn" data-key="p">P</button>
-    </div>
-    <div class="vk-row" id="vk-row-q2">
-      <button class="vk-btn" data-key="a">A</button><button class="vk-btn" data-key="s">S</button><button class="vk-btn" data-key="d">D</button><button class="vk-btn" data-key="f">F</button><button class="vk-btn" data-key="g">G</button><button class="vk-btn" data-key="h">H</button><button class="vk-btn" data-key="j">J</button><button class="vk-btn" data-key="k">K</button><button class="vk-btn" data-key="l">L</button>
-    </div>
-    <div class="vk-row" id="vk-row-q3">
-      <button class="vk-btn" data-key="z">Z</button><button class="vk-btn" data-key="x">X</button><button class="vk-btn" data-key="c">C</button><button class="vk-btn" data-key="v">V</button><button class="vk-btn" data-key="b">B</button><button class="vk-btn" data-key="n">N</button><button class="vk-btn" data-key="m">M</button>
-    </div>
+    <div class="vk-row" id="vk-row-q1"></div>
+    <div class="vk-row" id="vk-row-q2"></div>
+    <div class="vk-row" id="vk-row-q3"></div>
     <div class="vk-row" id="vk-row-sym">
       <button class="vk-btn sym" data-key="/">/</button><button class="vk-btn sym" data-key=".">.</button><button class="vk-btn sym" data-key="-">-</button><button class="vk-btn sym" data-key="_">_</button><button class="vk-btn sym" data-key="$">$</button><button class="vk-btn sym" data-key="#">#</button><button class="vk-btn sym" data-key="|">|</button><button class="vk-btn sym" data-key=">">></button><button class="vk-btn sym" data-key="~">~</button><button class="vk-btn sym" data-key="&">&amp;</button><button class="vk-btn sym" data-key=";">;</button><button class="vk-btn sym" data-key="*">*</button>
     </div>
@@ -543,13 +527,12 @@ async function startClaude() {
 }
 startBtn.addEventListener('click', startClaude);
 
+function wsReady() { return ws && ws.readyState === WebSocket.OPEN; }
+
 function sendMsg() {
   const text = msgInput.value;
   if (!text) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    log('SEND', 'WS not open');
-    return;
-  }
+  if (!wsReady()) { log('SEND', 'WS not open'); return; }
   ws.send(text + '\r');
   log('SEND', text);
   msgInput.value = '';
@@ -562,23 +545,26 @@ msgInput.addEventListener('keydown', e => {
 sendBtn.addEventListener('click', sendMsg);
 
 function wsSend(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (wsReady()) {
     ws.send(data);
     log('SEND', '0x' + data.charCodeAt(0).toString(16));
   }
 }
-$('btn-enter').addEventListener('click', () => wsSend('\r'));
-$('btn-c').addEventListener('click', () => wsSend('\x03'));
-$('btn-d').addEventListener('click', () => wsSend('\x04'));
-$('btn-left').addEventListener('click', () => wsSend('\x1b[D'));
-$('btn-up').addEventListener('click', () => wsSend('\x1b[A'));
-$('btn-down').addEventListener('click', () => wsSend('\x1b[B'));
-$('btn-right').addEventListener('click', () => wsSend('\x1b[C'));
-$('btn-tab').addEventListener('click', () => wsSend('\t'));
-$('btn-esc').addEventListener('click', () => wsSend('\x1b'));
+// toolbar buttons with data-ws attribute
+['btn-enter','btn-c','btn-d','btn-left','btn-up','btn-down','btn-right','btn-tab','btn-esc'].forEach(id => {
+  const b = $(id);
+  b.addEventListener('click', () => wsSend(b.dataset.ws));
+});
 $('btn-kill').addEventListener('click', () => { if (ws) ws.close(); log('KILL', 'forced'); });
 
 // ── virtual keyboard ──
+// generate QWERTY rows dynamically
+const VK_ROWS = [['q','w','e','r','t','y','u','i','o','p'],['a','s','d','f','g','h','j','k','l'],['z','x','c','v','b','n','m']];
+VK_ROWS.forEach((row, i) => {
+  const el = $('vk-row-q' + (i + 1));
+  row.forEach(k => { const b = document.createElement('button'); b.className = 'vk-btn'; b.dataset.key = k; b.textContent = k.toUpperCase(); el.appendChild(b); });
+});
+
 const vkMod = { ctrl: false, alt: false, shift: false, vt: false };
 const KEY_MAP = {
   esc: '\x1b', tab: '\t', spc: ' ', bs: '\x7f', enter: '\r',
