@@ -274,7 +274,10 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 if len(data) > WS_MSG_MAX:
                     continue
                 msg_count += 1
-                os.write(fd, data)
+                try:
+                    os.write(fd, data)
+                except OSError:
+                    pass
         finally:
             print(f"[ws] {peer} session end ({msg_count} msgs, {byte_count} bytes)")
             reader_task.cancel()
