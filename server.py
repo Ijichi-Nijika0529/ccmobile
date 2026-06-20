@@ -229,7 +229,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             print(f"[ws] {peer} spawn error: {e}")
             return await _ws_error(request, "Failed to start Claude Code")
 
-        ws = web.WebSocketResponse(heartbeat=15)
+        ws = web.WebSocketResponse(heartbeat=45, compress=False)
         await ws.prepare(request)
 
         print(f"[ws] {peer} Claude PID={_claude_pid} fd={fd}")
@@ -242,18 +242,23 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             nonlocal byte_count
             loop = asyncio.get_running_loop()
             try:
-                while True:
+                while not ws.closed:
                     try:
                         data = await loop.run_in_executor(None, os.read, fd, 65536)
-                        if not data:
-                            break
-                        byte_count += len(data)
-                        await ws.send_bytes(data)
                     except OSError as e:
                         if e.errno == errno.EIO:
                             break
+                        if e.errno == errno.EBADF:
+                            break
                         await asyncio.sleep(0.05)
-                    except asyncio.CancelledError:
+                        continue
+                    if not data:
+                        break
+                    byte_count += len(data)
+                    try:
+                        await ws.send_bytes(data)
+                        await ws.drain()
+                    except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
                         break
             finally:
                 print(f"[ws] {peer} PTY done ({byte_count} bytes)")
@@ -264,6 +269,34 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
         reader_task = asyncio.create_task(pty_to_ws())
 
+        async def _pty_write(data: bytes) -> bool:
+            """Write to PTY fd, waiting if buffer full. Returns False if slave died."""
+            loop = asyncio.get_running_loop()
+            while True:
+                try:
+                    os.write(fd, data)
+                    return True
+                except BlockingIOError:
+                    fut = loop.create_future()
+                    def _on_writable():
+                        try:
+                            loop.remove_writer(fd)
+                        except Exception:
+                            pass
+                        if not fut.done():
+                            fut.set_result(None)
+                    loop.add_writer(fd, _on_writable)
+                    try:
+                        await asyncio.wait_for(fut, timeout=3.0)
+                    except asyncio.TimeoutError:
+                        return False
+                    except asyncio.CancelledError:
+                        return False
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        return False
+                    raise
+
         try:
             async for msg in ws:
                 if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
@@ -271,11 +304,14 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 data = msg.data
                 if isinstance(data, str):
                     data = data.encode()
+                if not data:
+                    continue
                 if len(data) > WS_MSG_MAX:
                     continue
                 msg_count += 1
                 try:
-                    os.write(fd, data)
+                    if not await _pty_write(data):
+                        break
                 except OSError:
                     pass
         finally:
@@ -540,6 +576,11 @@ function connectWS() {
     ws.onopen = () => {
       setStatus(true, 'connected');
       log('WS', 'open');
+      ws._keepalive = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send('');
+        }
+      }, 10000);
     };
 
     ws.onmessage = e => {
@@ -576,6 +617,10 @@ function connectWS() {
     ws.onclose = () => {
       setStatus(false, 'disconnected');
       log('WS', 'closed after ' + byteCount + ' bytes received');
+      if (ws && ws._keepalive) {
+        clearInterval(ws._keepalive);
+        ws._keepalive = null;
+      }
       ws = null;
     };
 
@@ -591,6 +636,10 @@ async function startClaude() {
   byteCount = 0;
   startBtn.disabled = true;
   startBtn.textContent = 'Starting...';
+  if (ws && ws._keepalive) {
+    clearInterval(ws._keepalive);
+    ws._keepalive = null;
+  }
   try { await connectWS(); } catch (e) {
     log('START', 'FAIL: ' + e.message);
     startBtn.disabled = false;
