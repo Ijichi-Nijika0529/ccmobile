@@ -428,15 +428,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     </div>
   </div>
   <div id="toolbar">
-    <button class="tb-btn tb-enter" id="btn-enter" data-ws="\r">Enter &crarr;</button>
-    <button class="tb-btn tb-accent" id="btn-c" data-ws="\x03">^C</button>
-    <button class="tb-btn tb-accent" id="btn-d" data-ws="\x04">^D</button>
-    <button class="tb-btn tb-gray" id="btn-left" data-ws="\x1b[D">&larr;</button>
-    <button class="tb-btn tb-gray" id="btn-up" data-ws="\x1b[A">&uarr;</button>
-    <button class="tb-btn tb-gray" id="btn-down" data-ws="\x1b[B">&darr;</button>
-    <button class="tb-btn tb-gray" id="btn-right" data-ws="\x1b[C">&rarr;</button>
-    <button class="tb-btn tb-gray" id="btn-tab" data-ws="\t">Tab</button>
-    <button class="tb-btn tb-gray" id="btn-esc" data-ws="\x1b">Esc</button>
+    <button class="tb-btn tb-enter" id="btn-enter" data-key="enter">Enter &crarr;</button>
+    <button class="tb-btn tb-accent" id="btn-c" data-key="ctrl-c">^C</button>
+    <button class="tb-btn tb-accent" id="btn-d" data-key="ctrl-d">^D</button>
+    <button class="tb-btn tb-gray" id="btn-left" data-key="left">&larr;</button>
+    <button class="tb-btn tb-gray" id="btn-up" data-key="up">&uarr;</button>
+    <button class="tb-btn tb-gray" id="btn-down" data-key="down">&darr;</button>
+    <button class="tb-btn tb-gray" id="btn-right" data-key="right">&rarr;</button>
+    <button class="tb-btn tb-gray" id="btn-tab" data-key="tab">Tab</button>
+    <button class="tb-btn tb-gray" id="btn-esc" data-key="esc">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
@@ -553,6 +553,7 @@ function initTerminal() {
     term.loadAddon(fit);
     term.open(terminalContainer);
     fit.fit();
+    term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     window.addEventListener('resize', () => { try { fit.fit(); } catch(e){} });
     log('TERM', 'OK, cols=' + term.cols + ' rows=' + term.rows);
   } catch(e) {
@@ -671,10 +672,13 @@ function wsSend(data) {
     log('SEND', '0x' + data.charCodeAt(0).toString(16));
   }
 }
-// toolbar buttons with data-ws attribute
+// toolbar buttons with data-key attribute
 ['btn-enter','btn-c','btn-d','btn-left','btn-up','btn-down','btn-right','btn-tab','btn-esc'].forEach(id => {
   const b = $(id);
-  b.addEventListener('click', () => wsSend(b.dataset.ws));
+  b.addEventListener('click', () => {
+    const data = KEY_MAP[b.dataset.key];
+    if (data !== undefined) wsSend(data);
+  });
 });
 $('btn-kill').addEventListener('click', () => { if (ws) ws.close(); log('KILL', 'forced'); });
 
@@ -690,6 +694,8 @@ const vkMod = { ctrl: false, alt: false, shift: false, vt: false };
 const KEY_MAP = {
   esc: '\x1b', tab: '\t', spc: ' ', bs: '\x7f', enter: '\r',
   home: '\x1b[H', end: '\x1b[F', pgup: '\x1b[5~', pgdn: '\x1b[6~', del: '\x1b[3~',
+  left: '\x1b[D', right: '\x1b[C', up: '\x1b[A', down: '\x1b[B',
+  'ctrl-c': '\x03', 'ctrl-d': '\x04',
   '/': '/', '.': '.', '-': '-', '_': '_', '$': '$', '#': '#', '|': '|', '>': '>', '~': '~', '&': '&', ';': ';', '*': '*'
 };
 
