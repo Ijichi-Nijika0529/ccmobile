@@ -204,8 +204,17 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         return await _ws_error(request, "invalid token")
 
     if _lock.locked():
-        print(f"[ws] {peer} rejected - lock held")
-        return await _ws_error(request, "Claude Code is already running")
+        print(f"[ws] {peer} stale lock detected, cleaning up...")
+        await kill_claude()
+        # wait for old session's finally block to release the lock
+        for i in range(10):
+            if not _lock.locked():
+                break
+            await asyncio.sleep(0.5)
+        if _lock.locked():
+            print(f"[ws] {peer} lock still held after cleanup, forcing")
+            # cannot force-release asyncio.Lock; return error as last resort
+            return await _ws_error(request, "Please wait, previous session still closing")
 
     async with _lock:
         await kill_claude()
@@ -220,7 +229,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             print(f"[ws] {peer} spawn error: {e}")
             return await _ws_error(request, "Failed to start Claude Code")
 
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(heartbeat=15)
         await ws.prepare(request)
 
         print(f"[ws] {peer} Claude PID={_claude_pid} fd={fd}")
