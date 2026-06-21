@@ -260,6 +260,7 @@ async def spawn_claude() -> int:
 
 async def _ensure_claude() -> None:
     """Ensure Claude is running. Spawns if not. Raises RuntimeError on failure."""
+    global _claude_pid, _claude_fd, _broadcast_task
     async with _claude_lock:
         # Health check: is the PID still alive?
         if _claude_pid is not None:
