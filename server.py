@@ -10,6 +10,7 @@ import pty
 import secrets
 import termios
 import time
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web
@@ -74,6 +75,9 @@ _claude_fd: int | None = None
 _claude_lock = asyncio.Lock()          # guards spawn/kill only
 _ws_clients: set["web.WebSocketResponse"] = set()
 _broadcast_task: asyncio.Task | None = None
+_PTY_RING_SIZE = 10_485_760        # 10MB PTY history buffer
+_pty_ring: "deque[bytes]" = deque()
+_pty_ring_bytes = 0
 
 
 def _safe(fn, *args):
@@ -162,7 +166,7 @@ async def _safe_send(ws: "web.WebSocketResponse", data: bytes) -> bool:
 
 async def _cleanup_after_exit() -> None:
     """Notify all clients that Claude exited, close WebSockets, reset state."""
-    global _claude_pid, _claude_fd, _broadcast_task
+    global _claude_pid, _claude_fd, _broadcast_task, _pty_ring, _pty_ring_bytes
 
     # Snapshot clients BEFORE marking Claude dead
     stale_clients = list(_ws_clients)
@@ -171,6 +175,9 @@ async def _cleanup_after_exit() -> None:
     async with _claude_lock:
         _claude_pid = None
         _claude_fd = None
+        # Clear PTY history ring (stale data from dead session)
+        _pty_ring.clear()
+        _pty_ring_bytes = 0
 
     # Notify all stale clients
     exited_msg = json.dumps({"type": "exited"})
@@ -201,6 +208,7 @@ async def _broadcast_pty() -> None:
     Exits when Claude dies (EIO) or fd is closed (EBADF).
     On exit, calls _cleanup_after_exit to notify all clients.
     """
+    global _pty_ring, _pty_ring_bytes
     fd = _claude_fd
     if fd is None:
         return
@@ -219,6 +227,13 @@ async def _broadcast_pty() -> None:
                 continue
             if not data:
                 break
+
+            # Append to ring buffer for new-client replay
+            _pty_ring.append(data)
+            _pty_ring_bytes += len(data)
+            while _pty_ring_bytes > _PTY_RING_SIZE and _pty_ring:
+                old = _pty_ring.popleft()
+                _pty_ring_bytes -= len(old)
 
             # Fan out to ALL connected clients in parallel
             clients = [w for w in list(_ws_clients) if not w.closed]
@@ -404,10 +419,18 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     print(f"[ws] {peer} Claude PID={_claude_pid} fd={_claude_fd}")
 
-    # Register this client (broadcast task will now send to it)
+    # Replay PTY history so this client sees full context
+    if _pty_ring:
+        for chunk in list(_pty_ring):
+            try:
+                await ws.send_bytes(chunk)
+            except Exception:
+                break
+
+    # Register this client (broadcast task will now send live data)
     _add_client(ws)
 
-    # Tell this client Claude is ready
+    # Tell this client Claude is ready (terminal revealed)
     await ws.send_str(json.dumps({"type": "ready"}))
 
     msg_count = 0
