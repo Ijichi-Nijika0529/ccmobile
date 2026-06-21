@@ -71,26 +71,9 @@ def check_token(token: str) -> bool:
 
 _claude_pid: int | None = None
 _claude_fd: int | None = None
-_lock = asyncio.Lock()
-
-
-async def spawn_claude() -> int:
-    global _claude_pid, _claude_fd
-    Path(WORKDIR).mkdir(parents=True, exist_ok=True)
-
-    pid, fd = pty.fork()
-    if pid == 0:
-        # clear sensitive env vars before exec
-        for k in ("CCMOBILE_PASSWORD", "CCMOBILE_ACCOUNTS"):
-            os.environ.pop(k, None)
-        os.chdir(WORKDIR)
-        os.execvp("claude", ["claude"])
-        os._exit(127)
-    else:
-        _claude_pid = pid
-        _claude_fd = fd
-        os.set_blocking(fd, False)
-        return fd
+_claude_lock = asyncio.Lock()          # guards spawn/kill only
+_ws_clients: set["web.WebSocketResponse"] = set()
+_broadcast_task: asyncio.Task | None = None
 
 
 def _safe(fn, *args):
@@ -110,22 +93,218 @@ async def _ws_error(request: web.Request, msg: str) -> web.WebSocketResponse:
     return ws
 
 
-async def kill_claude():
-    global _claude_pid, _claude_fd
-    pid, fd = _claude_pid, _claude_fd
+# ── client registry ──────────────────────────────────────────────────
 
-    if fd is not None:
-        _safe(os.write, fd, b"\x04")
-        await asyncio.sleep(0.5)
-        _safe(os.close, fd)
+def _add_client(ws: "web.WebSocketResponse") -> None:
+    """Register a WebSocket client."""
+    _ws_clients.add(ws)
+
+
+def _remove_client(ws: "web.WebSocketResponse") -> None:
+    """Unregister a WebSocket client. Does NOT kill Claude."""
+    _ws_clients.discard(ws)
+
+
+# ── PTY write helper (module-level, shared by all clients) ──────────
+
+async def _pty_write(data: bytes) -> bool:
+    """Write to the shared Claude PTY fd.
+    Handles BlockingIOError with add_writer retry.
+    Returns False if the PTY slave has died or fd is invalid.
+    """
+    fd = _claude_fd
+    if fd is None:
+        return False
+
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            os.write(fd, data)
+            return True
+        except BlockingIOError:
+            fut = loop.create_future()
+            def _on_writable():
+                try:
+                    loop.remove_writer(fd)
+                except Exception:
+                    pass
+                if not fut.done():
+                    fut.set_result(None)
+            try:
+                loop.add_writer(fd, _on_writable)
+            except OSError:
+                return False
+            try:
+                await asyncio.wait_for(fut, timeout=3.0)
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                return False
+        except OSError as e:
+            if e.errno in (errno.EIO, errno.EBADF):
+                return False
+            raise
+
+
+# ── broadcast helpers ────────────────────────────────────────────────
+
+async def _safe_send(ws: "web.WebSocketResponse", data: bytes) -> bool:
+    """Send bytes to one WebSocket client. Returns True on success."""
+    try:
+        if ws.closed:
+            return False
+        await ws.send_bytes(data)
+        await ws.drain()
+        return True
+    except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+        return False
+
+
+async def _cleanup_after_exit() -> None:
+    """Notify all clients that Claude exited, close WebSockets, reset state."""
+    global _claude_pid, _claude_fd, _broadcast_task
+
+    # Snapshot clients BEFORE marking Claude dead
+    stale_clients = list(_ws_clients)
+
+    # Mark Claude dead under lock
+    async with _claude_lock:
+        _claude_pid = None
         _claude_fd = None
 
-    if pid is not None:
-        _safe(os.kill, pid, 15)
-        await asyncio.sleep(0.3)
-        _safe(os.kill, pid, 9)
-        _safe(os.waitpid, pid, 0)
-        _claude_pid = None
+    # Notify all stale clients
+    exited_msg = json.dumps({"type": "exited"})
+    for ws in stale_clients:
+        try:
+            if not ws.closed:
+                await ws.send_str(exited_msg)
+        except Exception:
+            pass
+
+    # Close all stale clients' WebSockets
+    for ws in stale_clients:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        _ws_clients.discard(ws)
+
+    # Only clear broadcast_task if we are still the current task
+    # (protects against a fresh spawn overwriting this)
+    current = asyncio.current_task()
+    if current is not None and _broadcast_task is current:
+        _broadcast_task = None
+
+
+async def _broadcast_pty() -> None:
+    """Single coroutine: read PTY → fan out to all connected clients.
+    Exits when Claude dies (EIO) or fd is closed (EBADF).
+    On exit, calls _cleanup_after_exit to notify all clients.
+    """
+    fd = _claude_fd
+    if fd is None:
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            try:
+                data = await loop.run_in_executor(None, os.read, fd, 65536)
+            except OSError as e:
+                if e.errno == errno.EIO:
+                    break  # Claude exited
+                if e.errno == errno.EBADF:
+                    break  # fd was closed by kill_claude
+                await asyncio.sleep(0.05)
+                continue
+            if not data:
+                break
+
+            # Fan out to ALL connected clients in parallel
+            clients = [w for w in list(_ws_clients) if not w.closed]
+            if clients:
+                results = await asyncio.gather(
+                    *[_safe_send(w, data) for w in clients],
+                    return_exceptions=True,
+                )
+                # Prune dead clients
+                for w, ok in zip(clients, results):
+                    if ok is not True:
+                        _ws_clients.discard(w)
+    finally:
+        await _cleanup_after_exit()
+
+
+# ── Claude lifecycle ─────────────────────────────────────────────────
+
+async def spawn_claude() -> int:
+    global _claude_pid, _claude_fd, _broadcast_task
+    Path(WORKDIR).mkdir(parents=True, exist_ok=True)
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        # clear sensitive env vars before exec
+        for k in ("CCMOBILE_PASSWORD", "CCMOBILE_ACCOUNTS"):
+            os.environ.pop(k, None)
+        os.chdir(WORKDIR)
+        os.execvp("claude", ["claude"])
+        os._exit(127)
+    else:
+        _claude_pid = pid
+        _claude_fd = fd
+        os.set_blocking(fd, False)
+        # Start the SINGLE broadcast task that fans PTY output to all clients
+        _broadcast_task = asyncio.create_task(_broadcast_pty())
+        return fd
+
+
+async def _ensure_claude() -> None:
+    """Ensure Claude is running. Spawns if not. Raises RuntimeError on failure."""
+    async with _claude_lock:
+        # Health check: is the PID still alive?
+        if _claude_pid is not None:
+            try:
+                os.kill(_claude_pid, 0)  # Signal 0 = existence check only
+            except OSError:
+                # Process is dead but globals weren't cleaned up
+                print("[ccmobile] Claude PID exists but process is dead, cleaning up")
+                _claude_pid = None
+                _claude_fd = None
+                _broadcast_task = None
+            else:
+                # Claude is alive and well
+                return
+
+        # Need to spawn
+        try:
+            await spawn_claude()
+        except FileNotFoundError:
+            raise RuntimeError("claude CLI not found")
+        except Exception as e:
+            raise RuntimeError(f"Failed to start Claude Code: {e}")
+
+
+async def kill_claude() -> None:
+    """Kill the Claude process. Safe to call from any context.
+    Closing the fd causes _broadcast_pty to detect EBADF → _cleanup_after_exit.
+    """
+    global _claude_pid, _claude_fd
+
+    async with _claude_lock:
+        pid, fd = _claude_pid, _claude_fd
+
+        if fd is not None:
+            _safe(os.write, fd, b"\x04")
+            await asyncio.sleep(0.5)
+            _safe(os.close, fd)
+            _claude_fd = None
+
+        if pid is not None:
+            _safe(os.kill, pid, 15)
+            await asyncio.sleep(0.3)
+            _safe(os.kill, pid, 9)
+            _safe(os.waitpid, pid, 0)
+            _claude_pid = None
 
 
 # ── HTTP handlers ────────────────────────────────────────────────────
@@ -145,7 +324,6 @@ def _check_origin(request: web.Request) -> bool:
     if not origin:
         return True
     host = request.headers.get("Host", "")
-    # extract host:port from origin URL
     try:
         origin_host = origin.split("://", 1)[1] if "://" in origin else origin
     except (IndexError, ValueError):
@@ -169,7 +347,6 @@ async def handle_login(request: web.Request) -> web.Response:
             pw = body.get("password", "")
         except (json.JSONDecodeError, AttributeError):
             return web.json_response({"error": "bad request"}, status=400)
-        # timing-safe comparison
         if not secrets.compare_digest(pw, PASSWORD):
             await asyncio.sleep(1)
             return web.json_response({"error": "wrong password"}, status=403)
@@ -197,134 +374,86 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     token = _get_token(request)
     peer = request.remote or "?"
-    print(f"[ws] connect from {peer}")
+    print(f"[ws] {peer} connect")
 
     if PASSWORD and not check_token(token):
         print(f"[ws] {peer} bad token")
         return await _ws_error(request, "invalid token")
 
-    if _lock.locked():
-        print(f"[ws] {peer} stale lock detected, cleaning up...")
+    # Stale lock detection (rare: a previous _ensure_claude or kill_claude hung)
+    if _claude_lock.locked():
+        print(f"[ws] {peer} stale Claude lock detected, cleaning up...")
         await kill_claude()
-        # wait for old session's finally block to release the lock
         for i in range(10):
-            if not _lock.locked():
+            if not _claude_lock.locked():
                 break
             await asyncio.sleep(0.5)
-        if _lock.locked():
-            print(f"[ws] {peer} lock still held after cleanup, forcing")
-            # cannot force-release asyncio.Lock; return error as last resort
-            return await _ws_error(request, "Please wait, previous session still closing")
+        if _claude_lock.locked():
+            print(f"[ws] {peer} Claude lock still held, forcing error")
+            return await _ws_error(request, "Please wait, session still closing")
 
-    async with _lock:
-        await kill_claude()
-        print(f"[ws] {peer} spawning Claude...")
+    # Ensure Claude is running (lazy spawn, shared by all clients)
+    try:
+        await _ensure_claude()
+    except RuntimeError as e:
+        print(f"[ws] {peer} Claude start failed: {e}")
+        return await _ws_error(request, str(e))
 
-        try:
-            fd = await spawn_claude()
-        except FileNotFoundError:
-            print(f"[ws] {peer} claude not found")
-            return await _ws_error(request, "claude CLI not found")
-        except Exception as e:
-            print(f"[ws] {peer} spawn error: {e}")
-            return await _ws_error(request, "Failed to start Claude Code")
+    ws = web.WebSocketResponse(heartbeat=45, compress=False)
+    await ws.prepare(request)
+    print(f"[ws] {peer} Claude PID={_claude_pid} fd={_claude_fd}")
 
-        ws = web.WebSocketResponse(heartbeat=45, compress=False)
-        await ws.prepare(request)
+    # Register this client (broadcast task will now send to it)
+    _add_client(ws)
 
-        print(f"[ws] {peer} Claude PID={_claude_pid} fd={fd}")
-        await ws.send_str(json.dumps({"type": "ready"}))
+    # Tell this client Claude is ready
+    await ws.send_str(json.dumps({"type": "ready"}))
 
-        byte_count = 0
-        msg_count = 0
+    msg_count = 0
 
-        async def pty_to_ws():
-            nonlocal byte_count
-            loop = asyncio.get_running_loop()
+    try:
+        async for msg in ws:
+            if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                break
+
+            data = msg.data
+
+            # JSON control messages
+            if isinstance(data, str):
+                try:
+                    ctrl = json.loads(data)
+                    if isinstance(ctrl, dict) and ctrl.get("type") == "kill":
+                        print(f"[ws] {peer} requested kill")
+                        await kill_claude()
+                        # broadcast task will detect EBADF → _cleanup_after_exit
+                        # → sends "exited" to all clients → closes WebSockets
+                        break
+                except (json.JSONDecodeError, AttributeError):
+                    pass  # Not JSON, fall through to PTY write
+
+            # Regular data → PTY
+            if isinstance(data, str):
+                data = data.encode()
+            if not data:
+                continue  # keepalive pings (empty)
+            if len(data) > WS_MSG_MAX:
+                continue
+
+            msg_count += 1
             try:
-                while not ws.closed:
-                    try:
-                        data = await loop.run_in_executor(None, os.read, fd, 65536)
-                    except OSError as e:
-                        if e.errno == errno.EIO:
-                            break
-                        if e.errno == errno.EBADF:
-                            break
-                        await asyncio.sleep(0.05)
-                        continue
-                    if not data:
-                        break
-                    byte_count += len(data)
-                    try:
-                        await ws.send_bytes(data)
-                        await ws.drain()
-                    except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
-                        break
-            finally:
-                print(f"[ws] {peer} PTY done ({byte_count} bytes)")
-                try:
-                    await ws.send_str(json.dumps({"type": "exited"}))
-                except Exception:
-                    pass
-
-        reader_task = asyncio.create_task(pty_to_ws())
-
-        async def _pty_write(data: bytes) -> bool:
-            """Write to PTY fd, waiting if buffer full. Returns False if slave died."""
-            loop = asyncio.get_running_loop()
-            while True:
-                try:
-                    os.write(fd, data)
-                    return True
-                except BlockingIOError:
-                    fut = loop.create_future()
-                    def _on_writable():
-                        try:
-                            loop.remove_writer(fd)
-                        except Exception:
-                            pass
-                        if not fut.done():
-                            fut.set_result(None)
-                    loop.add_writer(fd, _on_writable)
-                    try:
-                        await asyncio.wait_for(fut, timeout=3.0)
-                    except asyncio.TimeoutError:
-                        return False
-                    except asyncio.CancelledError:
-                        return False
-                except OSError as e:
-                    if e.errno == errno.EIO:
-                        return False
-                    raise
-
-        try:
-            async for msg in ws:
-                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
-                    break
-                data = msg.data
-                if isinstance(data, str):
-                    data = data.encode()
-                if not data:
-                    continue
-                if len(data) > WS_MSG_MAX:
-                    continue
-                msg_count += 1
-                try:
-                    if not await _pty_write(data):
-                        break
-                except OSError:
-                    pass
-        finally:
-            print(f"[ws] {peer} session end ({msg_count} msgs, {byte_count} bytes)")
-            reader_task.cancel()
-            try:
-                await reader_task
-            except asyncio.CancelledError:
+                if not await _pty_write(data):
+                    break  # PTY is dead (Claude exited)
+            except OSError:
                 pass
-            await kill_claude()
+    finally:
+        print(f"[ws] {peer} session end ({msg_count} msgs)")
+        _remove_client(ws)  # does NOT kill Claude
+        try:
             await ws.close()
+        except Exception:
+            pass
 
-        return ws
+    return ws
 
 
 # ── app ─────────────────────────────────────────────────────────────
@@ -571,20 +700,21 @@ function connectWS() {
   return new Promise((resolve, reject) => {
     const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws';
     log('WS', 'connecting...');
-    try { ws = new WebSocket(url); } catch(e) { log('WS', 'FAIL: '+e.message); reject(e); return; }
-    ws.binaryType = 'arraybuffer';
+    let sock;
+    try { sock = new WebSocket(url); ws = sock; } catch(e) { log('WS', 'FAIL: '+e.message); reject(e); return; }
+    sock.binaryType = 'arraybuffer';
 
-    ws.onopen = () => {
+    sock.onopen = () => {
       setStatus(true, 'connected');
       log('WS', 'open');
-      ws._keepalive = setInterval(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send('');
+      sock._keepalive = setInterval(() => {
+        if (sock && sock.readyState === WebSocket.OPEN) {
+          sock.send('');
         }
       }, 10000);
     };
 
-    ws.onmessage = e => {
+    sock.onmessage = e => {
       if (typeof e.data === 'string') {
         try {
           const m = JSON.parse(e.data);
@@ -615,17 +745,19 @@ function connectWS() {
       }
     };
 
-    ws.onclose = () => {
+    sock.onclose = () => {
       setStatus(false, 'disconnected');
       log('WS', 'closed after ' + byteCount + ' bytes received');
-      if (ws && ws._keepalive) {
-        clearInterval(ws._keepalive);
-        ws._keepalive = null;
+      if (sock._keepalive) {
+        clearInterval(sock._keepalive);
+        sock._keepalive = null;
       }
-      ws = null;
+      if (ws === sock) {
+        ws = null;
+      }
     };
 
-    ws.onerror = () => {
+    sock.onerror = () => {
       log('WS', 'onerror');
       setStatus(false, 'error');
       reject(new Error('WebSocket error'));
@@ -680,7 +812,12 @@ function wsSend(data) {
     if (data !== undefined) wsSend(data);
   });
 });
-$('btn-kill').addEventListener('click', () => { if (ws) ws.close(); log('KILL', 'forced'); });
+$('btn-kill').addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type: 'kill'}));
+    log('KILL', 'requested');
+  }
+});
 
 // ── virtual keyboard ──
 // generate QWERTY rows dynamically
