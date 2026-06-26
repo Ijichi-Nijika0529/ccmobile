@@ -732,13 +732,27 @@ function initTerminal() {
   }, { passive: false });
 })();
 
+    // ResizeObserver: calculate exact terminal height from available space
+    window._doFit = function() {
+      const main = mainScreen;
+      if (main.style.display === 'none') return;
+      let used = 0;
+      for (const c of main.children) {
+        if (c.id === 'terminal-container') continue;
+        if (c.style.display === 'none') continue;
+        used += c.offsetHeight;
+      }
+      const avail = main.offsetHeight - used;
+      if (avail > 80) {
+        terminalContainer.style.height = avail + 'px';
+        terminalContainer.style.flex = 'none';
+      }
+      try { fit.fit(); } catch(e) {}
+    };
     if (window.ResizeObserver) {
-      new ResizeObserver(() => {
-        requestAnimationFrame(() => { try { fit.fit(); } catch(e){} });
-      }).observe(terminalContainer);
-    } else {
-      window.addEventListener('resize', () => { try { fit.fit(); } catch(e){} });
+      new ResizeObserver(() => { requestAnimationFrame(window._doFit); }).observe(mainScreen);
     }
+    window.addEventListener('resize', () => { requestAnimationFrame(window._doFit); });
     log('TERM', 'OK, cols=' + term.cols + ' rows=' + term.rows);
   } catch(e) {
     log('TERM', 'FAIL: ' + e.message);
@@ -776,7 +790,7 @@ function connectWS() {
           if (m.type === 'ready') {
             setStatus(true, 'Claude Code running');
             startOverlay.style.display = 'none';
-            requestAnimationFrame(() => { try { fit.fit(); } catch(_){} });
+            requestAnimationFrame(() => { if (window._doFit) window._doFit(); });
             log('WS', 'Claude Code READY');
             resolve();
           } else if (m.type === 'exited') {
