@@ -700,13 +700,35 @@ function initTerminal() {
         brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
         brightCyan: '#56d4dd', brightWhite: '#f0f6fc'
       },
-      scrollback: 5000
+      scrollback: 5000,
+      smoothScrollDuration: 0
     });
     fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(terminalContainer);
     fit.fit();
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
+    term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
+// Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
+(() => {
+  const vp = terminalContainer.querySelector('.xterm-viewport');
+  if (!vp) return;
+  let acc = 0;
+  const LH = 17;
+  vp.addEventListener('wheel', e => {
+    if (term.buffer.active.type !== 'alternate') return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    e.preventDefault();
+    const dy = e.deltaMode === 1 ? e.deltaY * LH : e.deltaY;
+    acc += dy;
+    const lines = Math.trunc(acc / LH);
+    if (lines === 0) return;
+    acc -= lines * LH;
+    const n = Math.min(Math.abs(lines), 15);
+    ws.send((lines < 0 ? '\x1b[A' : '\x1b[B').repeat(n));
+  }, { passive: false });
+})();
+
     window.addEventListener('resize', () => { try { fit.fit(); } catch(e){} });
     log('TERM', 'OK, cols=' + term.cols + ' rows=' + term.rows);
   } catch(e) {
