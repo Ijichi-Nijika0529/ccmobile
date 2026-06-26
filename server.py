@@ -506,7 +506,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#58a6ff;--danger:#f85149;--green:#3fb950;--warn:#d29922}
-html,body{height:100%;overflow:hidden;background:var(--bg)}
+html,body{height:100%;height:100dvh;overflow:hidden;background:var(--bg)}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text);display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent}
 #login-screen{display:none;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:24px;gap:20px}
 #login-screen h1{font-size:22px;font-weight:600}
@@ -591,6 +591,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     <button class="tb-btn tb-gray" id="btn-tab" data-key="tab">Tab</button>
     <button class="tb-btn tb-gray" id="btn-esc" data-key="esc">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
+    <button class="tb-btn tb-gray" id="btn-bottom">⬇</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
   <div id="vk-panel">
@@ -706,14 +707,14 @@ function initTerminal() {
     fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(terminalContainer);
-    fit.fit();
+    requestAnimationFrame(() => { try { fit.fit(); } catch(e){} });
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
 // Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
 (() => {
   const vp = terminalContainer.querySelector('.xterm-viewport');
   if (!vp) return;
-  let acc = 0;
+  let acc = 0, _locked = false;
   const LH = 17;
   vp.addEventListener('wheel', e => {
     if (term.buffer.active.type !== 'alternate') return;
@@ -726,10 +727,17 @@ function initTerminal() {
     acc -= lines * LH;
     const n = Math.min(Math.abs(lines), 15);
     ws.send((lines < 0 ? '\x1b[A' : '\x1b[B').repeat(n));
+  if (lines < 0) _locked = true;
   }, { passive: false });
 })();
 
-    window.addEventListener('resize', () => { try { fit.fit(); } catch(e){} });
+    if (window.ResizeObserver) {
+      new ResizeObserver(() => {
+        requestAnimationFrame(() => { try { fit.fit(); } catch(e){} });
+      }).observe(terminalContainer);
+    } else {
+      window.addEventListener('resize', () => { try { fit.fit(); } catch(e){} });
+    }
     log('TERM', 'OK, cols=' + term.cols + ' rows=' + term.rows);
   } catch(e) {
     log('TERM', 'FAIL: ' + e.message);
@@ -767,7 +775,7 @@ function connectWS() {
           if (m.type === 'ready') {
             setStatus(true, 'Claude Code running');
             startOverlay.style.display = 'none';
-            try { fit.fit(); } catch(_){}
+            requestAnimationFrame(() => { try { fit.fit(); } catch(_){} });
             log('WS', 'Claude Code READY');
             resolve();
           } else if (m.type === 'exited') {
@@ -857,6 +865,13 @@ function wsSend(data) {
     const data = KEY_MAP[b.dataset.key];
     if (data !== undefined) wsSend(data);
   });
+});
+// bottom jump
+$('btn-bottom').addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send('G');
+    log('SCROLL', 'jump to bottom');
+  }
 });
 $('btn-kill').addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
