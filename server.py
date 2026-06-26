@@ -495,7 +495,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1117">
@@ -514,15 +514,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 #login-screen input:focus,#input-row input:focus{border-color:var(--accent)}
 #login-btn{padding:12px 28px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;width:100%;max-width:320px}
 #login-error{color:var(--danger);font-size:14px;min-height:20px}
-#main-screen{display:none;flex-direction:column;height:100%}
+#main-screen{display:none;flex-direction:column;height:100%;height:100dvh}
 #status-bar{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:var(--surface);border-bottom:1px solid var(--border);font-size:11px;flex-shrink:0}
 #status-dot{width:8px;height:8px;border-radius:50%;background:var(--danger);flex-shrink:0}
 #status-dot.on{background:var(--green)}
 #status-left{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
 #status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #logout-btn{font-size:10px;background:var(--border);color:var(--text);border:none;padding:4px 10px;border-radius:5px;cursor:pointer}
-#terminal-container{flex:1;padding:2px;overflow:hidden;min-height:0;user-select:text;-webkit-user-select:text}
-#terminal-container .xterm{height:100%;user-select:text;-webkit-user-select:text}
+#terminal-container{flex:1 1 0;padding:2px;overflow:hidden;min-height:0;user-select:text;-webkit-user-select:text}
+#terminal-container .xterm{height:100%!important;user-select:text;-webkit-user-select:text}
+#terminal-container .xterm-viewport{height:100%!important}
 .xterm-viewport::-webkit-scrollbar{width:4px}
 .xterm-viewport::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 #start-overlay{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:var(--bg);gap:12px}
