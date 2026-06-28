@@ -4,10 +4,12 @@
 import asyncio
 import hashlib
 import errno
+import fcntl
 import json
 import os
 import pty
 import secrets
+import struct
 import termios
 import time
 from collections import deque
@@ -78,6 +80,7 @@ _broadcast_task: asyncio.Task | None = None
 _PTY_RING_SIZE = 10_485_760        # 10MB PTY history buffer
 _pty_ring: "deque[bytes]" = deque()
 _pty_ring_bytes = 0
+_client_sizes: dict = {}            # ws -> (cols, rows), each client's natural fit
 
 
 def _safe(fn, *args):
@@ -150,6 +153,37 @@ async def _pty_write(data: bytes) -> bool:
             raise
 
 
+# ── PTY window size (shared, multi-client takes max) ────────────────
+
+def _set_winsize(cols: int, rows: int) -> None:
+    """Apply terminal size to the shared Claude PTY. Kernel sends SIGWINCH."""
+    fd = _claude_fd
+    if fd is None:
+        return
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
+async def _apply_max_winsize() -> None:
+    """Set PTY to the max cols/rows across all clients, then broadcast that
+    size so every client renders the same grid (smaller screens crop the grid).
+    """
+    if not _client_sizes:
+        return
+    cols = max(c for c, r in _client_sizes.values())
+    rows = max(r for c, r in _client_sizes.values())
+    _set_winsize(cols, rows)
+    msg = json.dumps({"type": "size", "cols": cols, "rows": rows})
+    for w in list(_ws_clients):
+        if not w.closed:
+            try:
+                await w.send_str(msg)
+            except Exception:
+                pass
+
+
 # ── broadcast helpers ────────────────────────────────────────────────
 
 async def _safe_send(ws: "web.WebSocketResponse", data: bytes) -> bool:
@@ -178,6 +212,7 @@ async def _cleanup_after_exit() -> None:
         # Clear PTY history ring (stale data from dead session)
         _pty_ring.clear()
         _pty_ring_bytes = 0
+        _client_sizes.clear()
 
     # Notify all stale clients
     exited_msg = json.dumps({"type": "exited"})
@@ -444,16 +479,26 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
             # JSON control messages
             if isinstance(data, str):
+                ctrl = None
                 try:
                     ctrl = json.loads(data)
-                    if isinstance(ctrl, dict) and ctrl.get("type") == "kill":
+                except (ValueError, TypeError):
+                    ctrl = None
+                if isinstance(ctrl, dict):
+                    t = ctrl.get("type")
+                    if t == "kill":
                         print(f"[ws] {peer} requested kill")
                         await kill_claude()
                         # broadcast task will detect EBADF → _cleanup_after_exit
                         # → sends "exited" to all clients → closes WebSockets
                         break
-                except (json.JSONDecodeError, AttributeError):
-                    pass  # Not JSON, fall through to PTY write
+                    if t == "resize":
+                        cols = int(ctrl.get("cols") or 0)
+                        rows = int(ctrl.get("rows") or 0)
+                        if 0 < cols <= 1000 and 0 < rows <= 1000:
+                            _client_sizes[ws] = (cols, rows)
+                            await _apply_max_winsize()
+                        continue  # do NOT write control JSON to the PTY
 
             # Regular data → PTY
             if isinstance(data, str):
@@ -472,6 +517,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     finally:
         print(f"[ws] {peer} session end ({msg_count} msgs)")
         _remove_client(ws)  # does NOT kill Claude
+        _client_sizes.pop(ws, None)
+        await _apply_max_winsize()  # recompute max for remaining clients
         try:
             await ws.close()
         except Exception:
@@ -495,7 +542,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1117">
@@ -506,7 +553,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#58a6ff;--danger:#f85149;--green:#3fb950;--warn:#d29922}
-html,body{height:100%;height:100dvh;overflow:hidden;background:var(--bg)}
+html,body{height:100%;overflow:hidden;background:var(--bg)}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text);display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent}
 #login-screen{display:none;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:24px;gap:20px}
 #login-screen h1{font-size:22px;font-weight:600}
@@ -514,19 +561,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 #login-screen input:focus,#input-row input:focus{border-color:var(--accent)}
 #login-btn{padding:12px 28px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;width:100%;max-width:320px}
 #login-error{color:var(--danger);font-size:14px;min-height:20px}
-#main-screen{display:none;flex-direction:column;height:100%;height:100dvh}
+#main-screen{display:none;flex-direction:column;height:100%}
 #status-bar{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:var(--surface);border-bottom:1px solid var(--border);font-size:11px;flex-shrink:0}
 #status-dot{width:8px;height:8px;border-radius:50%;background:var(--danger);flex-shrink:0}
 #status-dot.on{background:var(--green)}
 #status-left{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
 #status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #logout-btn{font-size:10px;background:var(--border);color:var(--text);border:none;padding:4px 10px;border-radius:5px;cursor:pointer}
-#terminal-container{flex:1 1 0;padding:2px;overflow:hidden;min-height:0;user-select:text;-webkit-user-select:text}
-#terminal-container .xterm{height:100%!important;user-select:text;-webkit-user-select:text}
-#terminal-container .xterm-viewport{height:100%!important}
+#terminal-container{flex:1;overflow:hidden;min-height:0;position:relative;user-select:text;-webkit-user-select:text}
+#terminal-container .xterm{position:absolute;left:0;bottom:0;user-select:text;-webkit-user-select:text}
 .xterm-viewport::-webkit-scrollbar{width:4px}
 .xterm-viewport::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-#start-overlay{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:var(--bg);gap:12px}
+#start-overlay{position:absolute;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--bg);gap:12px}
 #start-overlay p{font-size:13px;color:var(--text);opacity:.6}
 #start-btn{padding:16px 36px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}
 #toolbar{display:flex;gap:4px;padding:6px 8px;background:var(--surface);border-top:1px solid var(--border);flex-shrink:0;justify-content:center;flex-wrap:wrap}
@@ -592,7 +638,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     <button class="tb-btn tb-gray" id="btn-tab" data-key="tab">Tab</button>
     <button class="tb-btn tb-gray" id="btn-esc" data-key="esc">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
-    <button class="tb-btn tb-gray" id="btn-bottom">⬇</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
   <div id="vk-panel">
@@ -708,14 +753,17 @@ function initTerminal() {
     fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(terminalContainer);
-    requestAnimationFrame(() => { try { fit.fit(); } catch(e){} });
+    requestAnimationFrame(() => {
+      try { fit.fit(); } catch(e){}
+      requestAnimationFrame(() => { try { fit.fit(); } catch(e){} });
+    });
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
 // Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
 (() => {
   const vp = terminalContainer.querySelector('.xterm-viewport');
   if (!vp) return;
-  let acc = 0, _locked = false;
+  let acc = 0;
   const LH = 17;
   vp.addEventListener('wheel', e => {
     if (term.buffer.active.type !== 'alternate') return;
@@ -728,31 +776,18 @@ function initTerminal() {
     acc -= lines * LH;
     const n = Math.min(Math.abs(lines), 15);
     ws.send((lines < 0 ? '\x1b[A' : '\x1b[B').repeat(n));
-  if (lines < 0) _locked = true;
   }, { passive: false });
 })();
 
-    // ResizeObserver: calculate exact terminal height from available space
-    window._doFit = function() {
-      const main = mainScreen;
-      if (main.style.display === 'none') return;
-      let used = 0;
-      for (const c of main.children) {
-        if (c.id === 'terminal-container') continue;
-        if (c.style.display === 'none') continue;
-        used += c.offsetHeight;
-      }
-      const avail = main.offsetHeight - used;
-      if (avail > 80) {
-        terminalContainer.style.height = avail + 'px';
-        terminalContainer.style.flex = 'none';
-      }
-      try { fit.fit(); } catch(e) {}
-    };
-    if (window.ResizeObserver) {
-      new ResizeObserver(() => { requestAnimationFrame(window._doFit); }).observe(mainScreen);
-    }
-    window.addEventListener('resize', () => { requestAnimationFrame(window._doFit); });
+    let _rzT = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(_rzT);
+      _rzT = setTimeout(() => {
+        try { fit.fit(); } catch(e){}
+        if (ws && ws.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({type:'resize', cols: term.cols, rows: term.rows}));
+      }, 150);
+    });
     log('TERM', 'OK, cols=' + term.cols + ' rows=' + term.rows);
   } catch(e) {
     log('TERM', 'FAIL: ' + e.message);
@@ -790,7 +825,11 @@ function connectWS() {
           if (m.type === 'ready') {
             setStatus(true, 'Claude Code running');
             startOverlay.style.display = 'none';
-            requestAnimationFrame(() => { if (window._doFit) window._doFit(); });
+            requestAnimationFrame(() => {
+              try { fit.fit(); } catch(_){}
+              if (ws && ws.readyState === WebSocket.OPEN)
+                ws.send(JSON.stringify({type:'resize', cols: term.cols, rows: term.rows}));
+            });
             log('WS', 'Claude Code READY');
             resolve();
           } else if (m.type === 'exited') {
@@ -798,6 +837,10 @@ function connectWS() {
             log('WS', 'Claude exited');
             term.clear();
             startOverlay.style.display = 'flex';
+          } else if (m.type === 'size') {
+            if (m.cols && m.rows && (term.cols !== m.cols || term.rows !== m.rows)) {
+              try { term.resize(m.cols, m.rows); } catch(_){}
+            }
           } else if (m.type === 'error') {
             setStatus(false, m.msg);
             log('WS', 'ERROR: ' + m.msg);
@@ -880,13 +923,6 @@ function wsSend(data) {
     const data = KEY_MAP[b.dataset.key];
     if (data !== undefined) wsSend(data);
   });
-});
-// bottom jump
-$('btn-bottom').addEventListener('click', () => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send('G');
-    log('SCROLL', 'jump to bottom');
-  }
 });
 $('btn-kill').addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
