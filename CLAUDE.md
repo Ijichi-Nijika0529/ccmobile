@@ -8,6 +8,13 @@ ccmobile — 轻量级手机端 Claude Code 远程控制工具。整个应用是
 
 同目录下还有一个 `ssh_run.py`（在上级目录 `D:\VPS\`），用于通过 Paramiko SSH 远程初始化 VPS（安装依赖、创建 swap 等），是一次性工具，不是 ccmobile 本身的一部分。
 
+## 开发须知
+
+- **无测试套件**：没有 pytest、unittest 或任何自动化测试。验证修改靠手动启动服务器 + 浏览器访问 `http://localhost:8765`。
+- **无 lint/格式化配置**：纯 Python 脚本，无 CI/CD。
+- **依赖极简**：仅需 `aiohttp`（无 requirements.txt，直接 `pip3 install aiohttp`）。
+- **Python 3.10+**（代码中使用了 `str | None` 类型注解语法）。
+
 ## 运行与部署
 
 ```bash
@@ -23,7 +30,29 @@ python3 server.py
 
 默认监听 `0.0.0.0:8765`，可通过 `CCMOBILE_PORT` 环境变量修改。
 
-systemd 部署方式见 README.md。
+systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件当前不在仓库中，需要自行创建。
+
+## server.py 代码导航
+
+`server.py` 约 1050 行，用 `──` 注释分隔段落。按行号快速定位：
+
+| 行号（约） | 段落标记 | 内容 |
+|---|---|---|
+| 1-16 | imports | 标准库 + aiohttp |
+| 20-35 | `── config` | 环境变量读取、常量、`_secret` 生成、速率限制器 |
+| 40-70 | `── token helpers` | `_hash_token()` / `make_token()` / `check_token()` / `_check_rate()` |
+| 73-83 | `── Claude Code process manager` | 全局状态变量（`_claude_pid`, `_claude_fd`, `_ws_clients`, `_pty_ring` 等） |
+| 86-100 | `_safe()` / `_ws_error()` | 工具函数 |
+| 103-113 | `── client registry` | `_add_client()` / `_remove_client()` |
+| 115-153 | `── PTY write helper` | `_pty_write()` — 非阻塞写入，BlockingIOError 用 add_writer 重试 |
+| 156-185 | `── PTY window size` | `_set_winsize()` / `_apply_max_winsize()` — 多客户端取 max |
+| 187-285 | `── broadcast helpers` | `_broadcast_pty()`（唯一 PTY 读协程）、`_cleanup_after_exit()` |
+| 288-358 | `── Claude lifecycle` | `spawn_claude()` / `_ensure_claude()` / `kill_claude()` |
+| 361-416 | `── HTTP handlers` | `handle_index()` / `handle_login()` / `handle_check()` |
+| 418-527 | `── WebSocket handler` | `handle_ws()` — 鉴权→spawn→重放→消息循环 |
+| 530-538 | `── app` | `web.Application` 路由绑定 |
+| 539-1038 | `── embedded frontend` | `INDEX_HTML` 模板字符串（CSS + HTML + JS） |
+| 1041-1051 | `main()` | 入口 |
 
 ## 架构核心
 
@@ -49,6 +78,22 @@ systemd 部署方式见 README.md。
 - 速率限制：每个 IP 在 `LOGIN_RATE_WINDOW`（60s）内最多 `LOGIN_RATE_LIMIT`（5）次登录尝试
 - Origin 检查：WebSocket 连接会校验 `Origin` header 是否与 `Host` 一致，无 Origin 则放行（允许直接 IP 访问）
 - 如果不设置 `CCMOBILE_PASSWORD`，认证完全跳过（开放模式，会打印 WARNING）
+
+### WebSocket 协议消息
+
+连接建立后，客户端与服务器之间通过以下 JSON 消息通信：
+
+| 方向 | type | payload | 触发场景 |
+|---|---|---|---|
+| Client→Server | `{"type":"resize",cols,rows}` | 终端网格尺寸 | 窗口 resize / fit 后 |
+| Client→Server | `{"type":"kill"}` | 无 | 用户点击 Kill 按钮 |
+| Server→Client | `{"type":"ready"}` | 无 | Claude 启动完毕，前端隐藏 Start overlay |
+| Server→Client | `{"type":"exited"}` | 无 | Claude 进程退出，前端显示 Start overlay |
+| Server→Client | `{"type":"size",cols,rows}` | PTY winsize | `_apply_max_winsize()` 广播，客户端同步 `term.resize()` |
+| Server→Client | `{"type":"error","msg":"..."}` | 错误描述 | WebSocket 握手阶段（鉴权失败/启动失败） |
+
+- 非 JSON 的字符串和二进制消息直接写入 PTY（透传给 Claude）
+- 空消息（`""`）被前端每 10 秒发送一次作为 keepalive，服务器端 `if not data: continue` 忽略
 
 ### 前端结构（嵌入在 INDEX_HTML 中）
 
@@ -77,6 +122,7 @@ systemd 部署方式见 README.md。
 - `kill_claude()` 先发送 Ctrl+D（`\x04`），等待 0.5s，关闭 fd，再发送 SIGTERM → 等 0.3s → SIGKILL → waitpid
 - 前端 `ws.send('')` 每 10 秒发送空消息作为 keepalive，防止中间代理断开空闲连接
 - 依赖：Python 3.10+（用了 `str | None` 类型注解语法）、aiohttp、系统需安装 `claude` CLI
+- **日志前缀约定**：所有 `print()` 使用 `[ccmobile]` / `[ws]` / `[login]` 前缀，新增日志应遵循此约定
 
 ## 安全注意事项
 
