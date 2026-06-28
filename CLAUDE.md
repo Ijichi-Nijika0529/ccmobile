@@ -114,6 +114,7 @@ systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件
 | `CCMOBILE_PASSWORD` | "" | 登录密码（空=开放模式） |
 | `CCMOBILE_WORKDIR` | $HOME | Claude Code 工作目录 |
 | `CCMOBILE_TOKEN_EXPIRE` | 86400 | Token 过期秒数 |
+| `CCMOBILE_ACCOUNTS` | "" | （预留）多账号配置，当前未实现，spawn 子进程前会从环境中清除 |
 
 ## 关键实现细节
 
@@ -123,6 +124,11 @@ systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件
 - 前端 `ws.send('')` 每 10 秒发送空消息作为 keepalive，防止中间代理断开空闲连接
 - 依赖：Python 3.10+（用了 `str | None` 类型注解语法）、aiohttp、系统需安装 `claude` CLI
 - **日志前缀约定**：所有 `print()` 使用 `[ccmobile]` / `[ws]` / `[login]` 前缀，新增日志应遵循此约定
+- `WS_MSG_MAX`（1MB）和 `WS_IDLE_TIMEOUT`（30min）当前为模块级硬编码常量，如需调整可直接修改 `server.py` 顶部常量区
+
+## 待办 / 预留功能
+
+- **多账号系统**（`CCMOBILE_ACCOUNTS` 环境变量）：代码中仅在 spawn 子进程时清除该环境变量，尚未实现实际的账号管理、权限区分或多用户登录逻辑
 
 ## 安全注意事项
 
