@@ -56,7 +56,8 @@ systemd 部署方式见 README.md。
 - 登录界面 → 主界面（终端 + 工具栏 + 虚拟键盘 + 输入栏）
 - 工具栏提供常用快捷键按钮：Enter、^C、^D、方向键、Tab、Esc、Kill
 - 虚拟键盘：QWERTY 字母行、修饰键（Ctrl/Alt/Shift/Tab 可粘滞切换）、特殊键（Esc/Tab/Spc/BS/Enter/Home/End/PgUp/PgDn/Del）、CLI 符号行
-- 终端高度通过 ResizeObserver 动态计算可用空间
+- 终端尺寸：CSS flexbox（`#terminal-container` flex:1）+ FitAddon 计算 cols/rows。客户端用双 `requestAnimationFrame` 延迟首次 fit（避免容器未布局时高度为 0）
+- PTY 窗口大小传播：客户端发送 `{"type":"resize",cols,rows}`，服务器在所有客户端中**取最大**尺寸，通过 `TIOCSWINSZ` 设置 PTY（内核发 SIGWINCH 触发 Claude 重渲染），并广播 `{"type":"size"}` 令所有客户端网格与 PTY 一致；小屏客户端网格大于视口时用 CSS（`.xterm` 绝对定位 left:0;bottom:0）裁剪显示左下角（最新内容）
 - 双击标题或状态文字可切换调试面板（显示最近 50 条日志）
 - 备用屏幕模式下滚轮事件会批量发送，避免每条 scroll 一次 WebSocket 往返
 
