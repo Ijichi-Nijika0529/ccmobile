@@ -30,7 +30,7 @@ python3 server.py
 
 默认监听 `0.0.0.0:8765`，可通过 `CCMOBILE_PORT` 环境变量修改。
 
-systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件当前不在仓库中，需要自行创建。
+systemd 部署文件 `ccmobile.service` 已在仓库中，可直接使用。
 
 ### 生产部署
 
@@ -94,7 +94,7 @@ ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now 
 | 361-416 | `── HTTP handlers` | `handle_index()` / `handle_login()` / `handle_check()` |
 | 418-527 | `── WebSocket handler` | `handle_ws()` — 鉴权→spawn→重放→消息循环 |
 | 530-538 | `── app` | `web.Application` 路由绑定 |
-| 539-1038 | `── embedded frontend` | `INDEX_HTML` 模板字符串（CSS + HTML + JS） |
+| 539-1038 | `── embedded frontend` | `INDEX_HTML` 模板字符串（CSS + HTML + JS），内含 `// ── virtual keyboard ──` 子标记（行 934） |
 | 1041-1051 | `main()` | 入口 |
 
 ## 架构核心
