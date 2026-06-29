@@ -1045,7 +1045,7 @@ $('vk-panel').querySelectorAll('[data-key]').forEach(b => {
 // toggle keyboard
 $('btn-kbd').addEventListener('click', () => {
   const vk = $('vk-panel');
-  vk.style.display = vk.style.display === 'none' ? 'block' : 'none';
+  vk.style.display = vk.style.display === 'block' ? 'none' : 'block';
   log('VK', vk.style.display === 'block' ? 'shown' : 'hidden');
 });
 
