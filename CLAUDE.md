@@ -14,6 +14,7 @@ ccmobile — 轻量级手机端 Claude Code 远程控制工具。整个应用是
 - **无 lint/格式化配置**：纯 Python 脚本，无 CI/CD。
 - **依赖极简**：仅需 `aiohttp`（无 requirements.txt，直接 `pip3 install aiohttp`）。
 - **Python 3.10+**（代码中使用了 `str | None` 类型注解语法）。
+- **每次代码修改后必须部署到生产服务器**：push server.py 并 restart systemd 服务（部署命令见下方"日常部署"）。
 
 ## 运行与部署
 
