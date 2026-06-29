@@ -34,19 +34,46 @@ systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件
 
 ### 生产部署
 
-修改 `server.py` 后，部署到生产服务器并重启服务：
+### 日常部署（代码更新后）
+
+`/opt/ccmobile/` 为 root 所有，yachiyo 不能直接 scp，通过 `sudo tee` 管道写入：
 
 ```bash
-# 1. 复制 server.py 到服务器
-scp server.py root@66.154.101.210:/opt/ccmobile/server.py
+# 1. 推送 server.py 到服务器（在 ccmobile/ 目录下执行）
+ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
 
-# 2. SSH 连接到服务器并重启 ccmobile 服务
-ssh root@66.154.101.210 "systemctl restart ccmobile && systemctl status ccmobile"
+# 2. 重启服务并查看状态
+ssh 66.154.101.210 "sudo systemctl restart ccmobile && sudo systemctl status ccmobile --no-pager"
+```
+
+### 首次部署（新服务器/重装）
+
+```bash
+# 1. 创建目录
+ssh 66.154.101.210 "sudo mkdir -p /opt/ccmobile"
+
+# 2. 推送 server.py
+ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
+
+# 3. 安装依赖
+ssh 66.154.101.210 "sudo pip3 install aiohttp"
+
+# 4. 创建 .env（只做一次，密码不进仓库）
+ssh 66.154.101.210 "sudo tee /opt/ccmobile/.env" << 'EOF'
+CCMOBILE_PASSWORD=你的密码
+CCMOBILE_WORKDIR=/root/workspace
+EOF
+
+# 5. 推送并安装 systemd 服务
+ssh 66.154.101.210 "sudo tee /etc/systemd/system/ccmobile.service" < ccmobile.service
+ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now ccmobile"
 ```
 
 - 生产地址：`http://66.154.101.210:8765`
+- SSH 用户：`yachiyo`（已配置在 `~/.ssh/config`，密钥 `id_ed25519`）
 - 服务名：`ccmobile`（systemd 管理）
 - 部署路径：`/opt/ccmobile/server.py`
+- systemd service 文件：仓库中的 `ccmobile.service`
 
 ## server.py 代码导航
 

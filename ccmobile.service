@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code Mobile Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccmobile
+EnvironmentFile=/opt/ccmobile/.env
+ExecStart=/usr/bin/python3 /opt/ccmobile/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
