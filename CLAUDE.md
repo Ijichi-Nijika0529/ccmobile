@@ -32,6 +32,22 @@ python3 server.py
 
 systemd 部署：README.md 中引用了 `ccmobile.service` 文件，但该文件当前不在仓库中，需要自行创建。
 
+### 生产部署
+
+修改 `server.py` 后，部署到生产服务器并重启服务：
+
+```bash
+# 1. 复制 server.py 到服务器
+scp server.py root@66.154.101.210:/opt/ccmobile/server.py
+
+# 2. SSH 连接到服务器并重启 ccmobile 服务
+ssh root@66.154.101.210 "systemctl restart ccmobile && systemctl status ccmobile"
+```
+
+- 生产地址：`http://66.154.101.210:8765`
+- 服务名：`ccmobile`（systemd 管理）
+- 部署路径：`/opt/ccmobile/server.py`
+
 ## server.py 代码导航
 
 `server.py` 约 1050 行，用 `──` 注释分隔段落。按行号快速定位：
