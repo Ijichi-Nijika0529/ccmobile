@@ -763,20 +763,67 @@ function initTerminal() {
 (() => {
   const vp = terminalContainer.querySelector('.xterm-viewport');
   if (!vp) return;
-  let acc = 0;
-  const LH = 17;
+  let acc = 0, lastSign = 0, flushT = null;
+  const LH = 17, MAX = 15;
+
+  function sendLines(n) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (n === 0) return;
+    const cnt = Math.min(Math.abs(n), MAX);
+    ws.send((n < 0 ? '\x1b[A' : '\x1b[B').repeat(cnt));
+  }
+
+  function flush() {
+    if (flushT) { clearTimeout(flushT); flushT = null; }
+    acc = 0; lastSign = 0;
+  }
+
+  function scheduleFlush() {
+    if (flushT) clearTimeout(flushT);
+    flushT = setTimeout(flush, 100);
+  }
+
   vp.addEventListener('wheel', e => {
     if (term.buffer.active.type !== 'alternate') return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (e.ctrlKey || e.metaKey) return;
     e.preventDefault();
+
     const dy = e.deltaMode === 1 ? e.deltaY * LH : e.deltaY;
-    acc += dy;
-    const lines = Math.trunc(acc / LH);
-    if (lines === 0) return;
-    acc -= lines * LH;
-    const n = Math.min(Math.abs(lines), 15);
-    ws.send((lines < 0 ? '\x1b[A' : '\x1b[B').repeat(n));
+    if (dy === 0) return;
+
+    const sign = Math.sign(dy);
+
+    // direction change with meaningful residual: discard it
+    if (lastSign !== 0 && sign !== 0 && sign !== lastSign && Math.abs(acc) >= LH * 0.5) {
+      flush();
+    }
+
+    if (acc === 0 && Math.abs(dy) >= LH * 0.6) {
+      // fast path: large first delta -> send immediately
+      const lines = Math.trunc(dy / LH);
+      sendLines(lines);
+      acc = dy - lines * LH;
+      lastSign = Math.sign(acc) || 0;
+    } else {
+      acc += dy;
+      const lines = Math.trunc(acc / LH);
+      if (lines !== 0) {
+        sendLines(lines);
+        acc -= lines * LH;
+      }
+      lastSign = Math.sign(acc) || 0;
+    }
+
+    scheduleFlush();
   }, { passive: false });
+
+  // public reset for WS reconnect + tab hide
+  window._resetScrollAcc = flush;
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) flush();
+  });
 })();
 
     let _rzT = null;
@@ -811,6 +858,7 @@ function connectWS() {
     sock.onopen = () => {
       setStatus(true, 'connected');
       log('WS', 'open');
+      if (window._resetScrollAcc) window._resetScrollAcc();
       sock._keepalive = setInterval(() => {
         if (sock && sock.readyState === WebSocket.OPEN) {
           sock.send('');
