@@ -2,6 +2,7 @@
 """ccmobile — lightweight mobile remote control for Claude Code."""
 
 import asyncio
+import dataclasses
 import hashlib
 import errno
 import fcntl
@@ -70,17 +71,26 @@ def check_token(token: str) -> bool:
         return False
 
 
-# ── Claude Code process manager ─────────────────────────────────────
+# ── session (one Claude process per working directory) ─────────────
 
-_claude_pid: int | None = None
-_claude_fd: int | None = None
-_claude_lock = asyncio.Lock()          # guards spawn/kill only
-_ws_clients: set["web.WebSocketResponse"] = set()
-_broadcast_task: asyncio.Task | None = None
-_PTY_RING_SIZE = 10_485_760        # 10MB PTY history buffer
-_pty_ring: "deque[bytes]" = deque()
-_pty_ring_bytes = 0
-_client_sizes: dict = {}            # ws -> (cols, rows), each client's natural fit
+@dataclasses.dataclass
+class Session:
+    workdir: str
+    pid: int | None = None
+    fd: int | None = None
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    clients: "set[web.WebSocketResponse]" = dataclasses.field(default_factory=set)
+    ring: "deque[bytes]" = dataclasses.field(default_factory=deque)
+    ring_bytes: int = 0
+    client_sizes: dict = dataclasses.field(default_factory=dict)
+    broadcast_task: asyncio.Task | None = None
+    name: str = ""          # short dir name for display/URL
+
+
+_PTY_RING_SIZE = 10_485_760        # 10MB PTY history buffer (per session)
+
+_sessions: dict[str, Session] = {}  # dirname → Session
+_sessions_lock = asyncio.Lock()     # guards _sessions creation/deletion
 
 
 def _safe(fn, *args):
@@ -102,24 +112,24 @@ async def _ws_error(request: web.Request, msg: str) -> web.WebSocketResponse:
 
 # ── client registry ──────────────────────────────────────────────────
 
-def _add_client(ws: "web.WebSocketResponse") -> None:
-    """Register a WebSocket client."""
-    _ws_clients.add(ws)
+def _add_client(session: Session, ws: "web.WebSocketResponse") -> None:
+    """Register a WebSocket client into a session."""
+    session.clients.add(ws)
 
 
-def _remove_client(ws: "web.WebSocketResponse") -> None:
+def _remove_client(session: Session, ws: "web.WebSocketResponse") -> None:
     """Unregister a WebSocket client. Does NOT kill Claude."""
-    _ws_clients.discard(ws)
+    session.clients.discard(ws)
 
 
-# ── PTY write helper (module-level, shared by all clients) ──────────
+# ── PTY write helper ─────────────────────────────────────────────────
 
-async def _pty_write(data: bytes) -> bool:
-    """Write to the shared Claude PTY fd.
+async def _pty_write(session: Session, data: bytes) -> bool:
+    """Write to the session's PTY fd.
     Handles BlockingIOError with add_writer retry.
     Returns False if the PTY slave has died or fd is invalid.
     """
-    fd = _claude_fd
+    fd = session.fd
     if fd is None:
         return False
 
@@ -153,11 +163,11 @@ async def _pty_write(data: bytes) -> bool:
             raise
 
 
-# ── PTY window size (shared, multi-client takes max) ────────────────
+# ── PTY window size (per session, multi-client takes max) ───────────
 
-def _set_winsize(cols: int, rows: int) -> None:
-    """Apply terminal size to the shared Claude PTY. Kernel sends SIGWINCH."""
-    fd = _claude_fd
+def _set_winsize(session: Session, cols: int, rows: int) -> None:
+    """Apply terminal size to the session's PTY. Kernel sends SIGWINCH."""
+    fd = session.fd
     if fd is None:
         return
     try:
@@ -166,17 +176,17 @@ def _set_winsize(cols: int, rows: int) -> None:
         pass
 
 
-async def _apply_max_winsize() -> None:
-    """Set PTY to the max cols/rows across all clients, then broadcast that
-    size so every client renders the same grid (smaller screens crop the grid).
+async def _apply_max_winsize(session: Session) -> None:
+    """Set PTY to the max cols/rows across all clients of a session,
+    then broadcast that size so every client renders the same grid.
     """
-    if not _client_sizes:
+    if not session.client_sizes:
         return
-    cols = max(c for c, r in _client_sizes.values())
-    rows = max(r for c, r in _client_sizes.values())
-    _set_winsize(cols, rows)
+    cols = max(c for c, r in session.client_sizes.values())
+    rows = max(r for c, r in session.client_sizes.values())
+    _set_winsize(session, cols, rows)
     msg = json.dumps({"type": "size", "cols": cols, "rows": rows})
-    for w in list(_ws_clients):
+    for w in list(session.clients):
         if not w.closed:
             try:
                 await w.send_str(msg)
@@ -198,21 +208,18 @@ async def _safe_send(ws: "web.WebSocketResponse", data: bytes) -> bool:
         return False
 
 
-async def _cleanup_after_exit() -> None:
-    """Notify all clients that Claude exited, close WebSockets, reset state."""
-    global _claude_pid, _claude_fd, _broadcast_task, _pty_ring, _pty_ring_bytes
-
+async def _cleanup_after_exit(session: Session) -> None:
+    """Notify all session clients that Claude exited, close WS, reset state."""
     # Snapshot clients BEFORE marking Claude dead
-    stale_clients = list(_ws_clients)
+    stale_clients = list(session.clients)
 
     # Mark Claude dead under lock
-    async with _claude_lock:
-        _claude_pid = None
-        _claude_fd = None
-        # Clear PTY history ring (stale data from dead session)
-        _pty_ring.clear()
-        _pty_ring_bytes = 0
-        _client_sizes.clear()
+    async with session.lock:
+        session.pid = None
+        session.fd = None
+        session.ring.clear()
+        session.ring_bytes = 0
+        session.client_sizes.clear()
 
     # Notify all stale clients
     exited_msg = json.dumps({"type": "exited"})
@@ -229,22 +236,20 @@ async def _cleanup_after_exit() -> None:
             await ws.close()
         except Exception:
             pass
-        _ws_clients.discard(ws)
+        session.clients.discard(ws)
 
     # Only clear broadcast_task if we are still the current task
-    # (protects against a fresh spawn overwriting this)
     current = asyncio.current_task()
-    if current is not None and _broadcast_task is current:
-        _broadcast_task = None
+    if current is not None and session.broadcast_task is current:
+        session.broadcast_task = None
 
 
-async def _broadcast_pty() -> None:
-    """Single coroutine: read PTY → fan out to all connected clients.
+async def _broadcast_pty(session: Session) -> None:
+    """Read PTY → fan out to all session clients.
     Exits when Claude dies (EIO) or fd is closed (EBADF).
-    On exit, calls _cleanup_after_exit to notify all clients.
+    On exit, calls _cleanup_after_exit.
     """
-    global _pty_ring, _pty_ring_bytes
-    fd = _claude_fd
+    fd = session.fd
     if fd is None:
         return
 
@@ -255,107 +260,123 @@ async def _broadcast_pty() -> None:
                 data = await loop.run_in_executor(None, os.read, fd, 65536)
             except OSError as e:
                 if e.errno == errno.EIO:
-                    break  # Claude exited
+                    break
                 if e.errno == errno.EBADF:
-                    break  # fd was closed by kill_claude
+                    break
                 await asyncio.sleep(0.05)
                 continue
             if not data:
                 break
 
             # Append to ring buffer for new-client replay
-            _pty_ring.append(data)
-            _pty_ring_bytes += len(data)
-            while _pty_ring_bytes > _PTY_RING_SIZE and _pty_ring:
-                old = _pty_ring.popleft()
-                _pty_ring_bytes -= len(old)
+            session.ring.append(data)
+            session.ring_bytes += len(data)
+            while session.ring_bytes > _PTY_RING_SIZE and session.ring:
+                old = session.ring.popleft()
+                session.ring_bytes -= len(old)
 
-            # Fan out to ALL connected clients in parallel
-            clients = [w for w in list(_ws_clients) if not w.closed]
+            # Fan out to all session clients
+            clients = [w for w in list(session.clients) if not w.closed]
             if clients:
                 results = await asyncio.gather(
                     *[_safe_send(w, data) for w in clients],
                     return_exceptions=True,
                 )
-                # Prune dead clients
                 for w, ok in zip(clients, results):
                     if ok is not True:
-                        _ws_clients.discard(w)
+                        session.clients.discard(w)
     finally:
-        await _cleanup_after_exit()
+        await _cleanup_after_exit(session)
 
 
 # ── Claude lifecycle ─────────────────────────────────────────────────
 
-async def spawn_claude() -> int:
-    global _claude_pid, _claude_fd, _broadcast_task
-    Path(WORKDIR).mkdir(parents=True, exist_ok=True)
+async def spawn_claude(session: Session) -> int:
+    Path(session.workdir).mkdir(parents=True, exist_ok=True)
 
     pid, fd = pty.fork()
     if pid == 0:
-        # clear sensitive env vars before exec
         for k in ("CCMOBILE_PASSWORD", "CCMOBILE_ACCOUNTS"):
             os.environ.pop(k, None)
-        os.chdir(WORKDIR)
+        os.chdir(session.workdir)
         os.execvp("claude", ["claude"])
         os._exit(127)
     else:
-        _claude_pid = pid
-        _claude_fd = fd
+        session.pid = pid
+        session.fd = fd
         os.set_blocking(fd, False)
-        # Start the SINGLE broadcast task that fans PTY output to all clients
-        _broadcast_task = asyncio.create_task(_broadcast_pty())
+        session.broadcast_task = asyncio.create_task(_broadcast_pty(session))
         return fd
 
 
-async def _ensure_claude() -> None:
-    """Ensure Claude is running. Spawns if not. Raises RuntimeError on failure."""
-    global _claude_pid, _claude_fd, _broadcast_task
-    async with _claude_lock:
-        # Health check: is the PID still alive?
-        if _claude_pid is not None:
+async def _ensure_claude(session: Session) -> None:
+    """Ensure session's Claude is running. Spawns if not."""
+    async with session.lock:
+        if session.pid is not None:
             try:
-                os.kill(_claude_pid, 0)  # Signal 0 = existence check only
+                os.kill(session.pid, 0)
             except OSError:
-                # Process is dead but globals weren't cleaned up
-                print("[ccmobile] Claude PID exists but process is dead, cleaning up")
-                _claude_pid = None
-                _claude_fd = None
-                _broadcast_task = None
+                print(f"[ccmobile] {session.name}: PID existed but dead, cleaning up")
+                session.pid = None
+                session.fd = None
+                session.broadcast_task = None
             else:
-                # Claude is alive and well
                 return
-
-        # Need to spawn
         try:
-            await spawn_claude()
+            await spawn_claude(session)
+            print(f"[ccmobile] {session.name}: Claude started (PID={session.pid})")
         except FileNotFoundError:
             raise RuntimeError("claude CLI not found")
         except Exception as e:
             raise RuntimeError(f"Failed to start Claude Code: {e}")
 
 
-async def kill_claude() -> None:
-    """Kill the Claude process. Safe to call from any context.
-    Closing the fd causes _broadcast_pty to detect EBADF → _cleanup_after_exit.
-    """
-    global _claude_pid, _claude_fd
-
-    async with _claude_lock:
-        pid, fd = _claude_pid, _claude_fd
-
+async def kill_claude(session: Session) -> None:
+    """Kill the session's Claude process. Closing fd triggers cleanup chain."""
+    async with session.lock:
+        pid, fd = session.pid, session.fd
         if fd is not None:
             _safe(os.write, fd, b"\x04")
             await asyncio.sleep(0.5)
             _safe(os.close, fd)
-            _claude_fd = None
-
+            session.fd = None
         if pid is not None:
             _safe(os.kill, pid, 15)
             await asyncio.sleep(0.3)
             _safe(os.kill, pid, 9)
             _safe(os.waitpid, pid, 0)
-            _claude_pid = None
+            session.pid = None
+
+
+async def _get_or_create_session(dirname: str) -> Session | None:
+    """Look up or create a Session for the given directory name.
+    Validates the path is within WORKDIR. Returns None if invalid.
+    """
+    # resolve to absolute, verify it's under WORKDIR
+    workdir = WORKDIR if dirname == "." else os.path.join(WORKDIR, dirname)
+    workdir = str(Path(workdir).resolve())
+
+    if not workdir.startswith(WORKDIR + os.sep) and workdir != WORKDIR:
+        return None
+
+    # Use canonical key for dedup
+    key = workdir
+
+    async with _sessions_lock:
+        if key not in _sessions:
+            _sessions[key] = Session(workdir=workdir, name=dirname)
+        return _sessions[key]
+
+
+def _is_session_running(session: Session) -> bool:
+    """Check if a session has a live Claude process."""
+    if session.pid is None:
+        return False
+    try:
+        os.kill(session.pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 # ── HTTP handlers ────────────────────────────────────────────────────
@@ -415,6 +436,72 @@ async def handle_check(request: web.Request) -> web.Response:
     return web.json_response({"valid": check_token(token)})
 
 
+async def handle_dirs(request: web.Request) -> web.Response:
+    """List WORKDIR itself + direct subdirectories with running status."""
+    token = _get_token(request)
+    if PASSWORD and not check_token(token):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    dirs = []
+    # always include WORKDIR itself as "."
+    dirs.append({
+        "name": ".",
+        "label": Path(WORKDIR).name or "workspace",
+        "running": _is_session_running(_sessions.get(WORKDIR, Session(workdir=WORKDIR, name=".")))
+                     if WORKDIR in _sessions else False,
+    })
+
+    try:
+        entries = sorted(os.scandir(WORKDIR), key=lambda e: e.name.lower())
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name.startswith("."):
+                continue
+            full = str(Path(entry.path).resolve())
+            s = _sessions.get(full)
+            dirs.append({
+                "name": name,
+                "label": name,
+                "running": _is_session_running(s) if s else False,
+            })
+    except OSError:
+        pass
+
+    return web.json_response({"parent": WORKDIR, "dirs": dirs})
+
+
+async def handle_mkdir(request: web.Request) -> web.Response:
+    """Create a new subdirectory under WORKDIR."""
+    token = _get_token(request)
+    if PASSWORD and not check_token(token):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    try:
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400)
+
+    if not name or len(name) > 100:
+        return web.json_response({"error": "invalid name"}, status=400)
+
+    # reject dangerous characters
+    for ch in ("..", "/", "\\", "\x00"):
+        if ch in name:
+            return web.json_response({"error": "invalid name"}, status=400)
+
+    full = os.path.join(WORKDIR, name)
+    try:
+        Path(full).mkdir(parents=False, exist_ok=True)
+    except OSError as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+    print(f"[ccmobile] mkdir: {full}")
+    return web.json_response({"ok": True, "path": full})
+
+
 # ── WebSocket handler ────────────────────────────────────────────────
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
@@ -425,56 +512,58 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     token = _get_token(request)
     peer = request.remote or "?"
-    print(f"[ws] {peer} connect")
+    dirname = (request.query.get("dir") or ".").strip()
+    print(f"[ws] {peer} connect dir={dirname}")
 
     if PASSWORD and not check_token(token):
         print(f"[ws] {peer} bad token")
         return await _ws_error(request, "invalid token")
 
-    # Stale lock detection (rare: a previous _ensure_claude or kill_claude hung)
-    if _claude_lock.locked():
-        print(f"[ws] {peer} stale Claude lock detected, cleaning up...")
-        await kill_claude()
+    # Get or create session for this directory
+    session = await _get_or_create_session(dirname)
+    if session is None:
+        print(f"[ws] {peer} invalid dir: {dirname}")
+        return await _ws_error(request, "invalid directory")
+
+    # Stale lock detection for this session
+    if session.lock.locked():
+        print(f"[ws] {peer} stale lock for {session.name}, cleaning up...")
+        await kill_claude(session)
         for i in range(10):
-            if not _claude_lock.locked():
+            if not session.lock.locked():
                 break
             await asyncio.sleep(0.5)
-        if _claude_lock.locked():
-            print(f"[ws] {peer} Claude lock still held, forcing error")
+        if session.lock.locked():
+            print(f"[ws] {peer} {session.name} lock still held, forcing error")
             return await _ws_error(request, "Please wait, session still closing")
 
-    # Ensure Claude is running (lazy spawn, shared by all clients)
+    # Ensure Claude is running for this session
     try:
-        await _ensure_claude()
+        await _ensure_claude(session)
     except RuntimeError as e:
-        print(f"[ws] {peer} Claude start failed: {e}")
+        print(f"[ws] {peer} {session.name} Claude start failed: {e}")
         return await _ws_error(request, str(e))
 
     ws = web.WebSocketResponse(heartbeat=45, compress=False)
     await ws.prepare(request)
-    print(f"[ws] {peer} Claude PID={_claude_pid} fd={_claude_fd}")
+    print(f"[ws] {peer} {session.name} PID={session.pid} fd={session.fd}")
 
-    # Replay PTY history so this client sees full context
-    if _pty_ring:
-        for chunk in list(_pty_ring):
+    # Replay PTY history
+    if session.ring:
+        for chunk in list(session.ring):
             try:
                 await ws.send_bytes(chunk)
             except Exception:
                 break
 
-    # Register this client (broadcast task will now send live data)
-    _add_client(ws)
-
-    # Tell this client Claude is ready (terminal revealed)
+    _add_client(session, ws)
     await ws.send_str(json.dumps({"type": "ready"}))
 
     msg_count = 0
-
     try:
         async for msg in ws:
             if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                 break
-
             data = msg.data
 
             # JSON control messages
@@ -487,38 +576,36 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 if isinstance(ctrl, dict):
                     t = ctrl.get("type")
                     if t == "kill":
-                        print(f"[ws] {peer} requested kill")
-                        await kill_claude()
-                        # broadcast task will detect EBADF → _cleanup_after_exit
-                        # → sends "exited" to all clients → closes WebSockets
+                        print(f"[ws] {peer} {session.name} requested kill")
+                        await kill_claude(session)
                         break
                     if t == "resize":
                         cols = int(ctrl.get("cols") or 0)
                         rows = int(ctrl.get("rows") or 0)
                         if 0 < cols <= 1000 and 0 < rows <= 1000:
-                            _client_sizes[ws] = (cols, rows)
-                            await _apply_max_winsize()
-                        continue  # do NOT write control JSON to the PTY
+                            session.client_sizes[ws] = (cols, rows)
+                            await _apply_max_winsize(session)
+                        continue
 
             # Regular data → PTY
             if isinstance(data, str):
                 data = data.encode()
             if not data:
-                continue  # keepalive pings (empty)
+                continue
             if len(data) > WS_MSG_MAX:
                 continue
 
             msg_count += 1
             try:
-                if not await _pty_write(data):
-                    break  # PTY is dead (Claude exited)
+                if not await _pty_write(session, data):
+                    break
             except OSError:
                 pass
     finally:
-        print(f"[ws] {peer} session end ({msg_count} msgs)")
-        _remove_client(ws)  # does NOT kill Claude
-        _client_sizes.pop(ws, None)
-        await _apply_max_winsize()  # recompute max for remaining clients
+        print(f"[ws] {peer} {session.name} session end ({msg_count} msgs)")
+        _remove_client(session, ws)
+        session.client_sizes.pop(ws, None)
+        await _apply_max_winsize(session)
         try:
             await ws.close()
         except Exception:
@@ -533,6 +620,8 @@ app = web.Application()
 app.router.add_get("/", handle_index)
 app.router.add_post("/login", handle_login)
 app.router.add_get("/check", handle_check)
+app.router.add_get("/api/dirs", handle_dirs)
+app.router.add_post("/api/mkdir", handle_mkdir)
 app.router.add_get("/ws", handle_ws)
 
 
@@ -572,9 +661,28 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 #terminal-container .xterm{position:absolute;left:0;bottom:0;user-select:text;-webkit-user-select:text}
 .xterm-viewport::-webkit-scrollbar{width:4px}
 .xterm-viewport::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-#start-overlay{position:absolute;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--bg);gap:12px}
-#start-overlay p{font-size:13px;color:var(--text);opacity:.6}
-#start-btn{padding:16px 36px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}
+#start-overlay{position:absolute;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;background:var(--bg);gap:10px;padding:20px 16px;overflow-y:auto}
+#start-overlay h2{font-size:16px;font-weight:600;margin-bottom:4px}
+#dir-list{width:100%;max-width:360px;display:flex;flex-direction:column;gap:6px}
+.dir-card{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface);border:2px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .15s;text-align:left}
+.dir-card.selected{border-color:var(--accent)}
+.dir-card.running{border-color:var(--green)}
+.dir-card.running.selected{border-color:var(--accent)}
+.dir-icon{font-size:22px;flex-shrink:0}
+.dir-info{flex:1;min-width:0}
+.dir-name{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dir-status{font-size:11px;margin-top:2px}
+.dir-status.stopped{color:var(--text);opacity:.5}
+.dir-status.running{color:var(--green)}
+.dir-status .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.dir-status .dot.running{background:var(--green)}
+.dir-status .dot.stopped{background:var(--border)}
+#dir-new{width:100%;max-width:360px;display:flex;gap:6px}
+#dir-new-input{flex:1;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;outline:none;min-width:0}
+#dir-new-input:focus{border-color:var(--accent)}
+#dir-new-btn{padding:10px 16px;background:var(--border);color:var(--text);border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0}
+#start-btn{padding:14px 32px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;min-width:200px}
+#start-btn:disabled{opacity:.5;cursor:default}
 #toolbar{display:flex;gap:4px;padding:6px 8px;background:var(--surface);border-top:1px solid var(--border);flex-shrink:0;justify-content:center;flex-wrap:wrap}
 .tb-btn{padding:8px 10px;font-size:12px;border-radius:6px;text-align:center;border:none;font-weight:600;cursor:pointer;color:#fff}
 .tb-accent{background:var(--accent)}
@@ -623,8 +731,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
   </div>
   <div id="terminal-container">
     <div id="start-overlay">
-      <button id="start-btn">Start Claude Code</button>
-      <p>Terminal ready</p>
+      <h2>选择工作目录</h2>
+      <div id="dir-list"></div>
+      <div id="dir-new">
+        <input id="dir-new-input" type="text" placeholder="新建目录..." enterkeyhint="done" autocomplete="off" autocapitalize="none">
+        <button id="dir-new-btn">创建</button>
+      </div>
+      <button id="start-btn" disabled>请选择目录</button>
     </div>
   </div>
   <div id="toolbar">
@@ -694,6 +807,8 @@ const pwInput = $('pw-input'), loginBtn = $('login-btn'), loginError = $('login-
 const statusDot = $('status-dot'), statusText = $('status-text');
 const terminalContainer = $('terminal-container');
 const startOverlay = $('start-overlay'), startBtn = $('start-btn');
+const dirList = $('dir-list'), dirNewInput = $('dir-new-input'), dirNewBtn = $('dir-new-btn');
+let selectedDir = null, dirsLoaded = false;
 const msgInput = $('msg-input'), sendBtn = $('send-btn');
 
 async function tryLogin(pw) {
@@ -847,10 +962,11 @@ function setStatus(on, text) {
   log('STATUS', text);
 }
 
-function connectWS() {
+function connectWS(dir) {
   return new Promise((resolve, reject) => {
-    const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws';
-    log('WS', 'connecting...');
+    const dirParam = encodeURIComponent(dir || '.');
+    const url = (location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws?dir=' + dirParam;
+    log('WS', 'connecting dir=' + (dir||'.') + '...');
     let sock;
     try { sock = new WebSocket(url); ws = sock; } catch(e) { log('WS', 'FAIL: '+e.message); reject(e); return; }
     sock.binaryType = 'arraybuffer';
@@ -885,6 +1001,7 @@ function connectWS() {
             log('WS', 'Claude exited');
             term.clear();
             startOverlay.style.display = 'flex';
+            loadDirs();
           } else if (m.type === 'size') {
             if (m.cols && m.rows && (term.cols !== m.cols || term.rows !== m.rows)) {
               try { term.resize(m.cols, m.rows); } catch(_){}
@@ -925,7 +1042,83 @@ function connectWS() {
   });
 }
 
+async function loadDirs() {
+  try {
+    const res = await fetch('/api/dirs');
+    const data = await res.json();
+    dirList.innerHTML = '';
+    selectedDir = null;
+    data.dirs.forEach(d => {
+      const card = document.createElement('div');
+      card.className = 'dir-card' + (d.running ? ' running' : '');
+      card.dataset.name = d.name;
+      const icon = d.name === '.' ? '\u{1F3E0}' : '\u{1F4C1}';
+      card.innerHTML =
+        '<span class="dir-icon">' + icon + '</span>' +
+        '<div class="dir-info">' +
+          '<div class="dir-name">' + escapeHtml(d.label) + '</div>' +
+          '<div class="dir-status ' + (d.running ? 'running' : 'stopped') + '">' +
+            '<span class="dot ' + (d.running ? 'running' : 'stopped') + '"></span>' +
+            (d.running ? '运行中' : '未启动') +
+          '</div>' +
+        '</div>';
+      card.addEventListener('click', () => {
+        dirList.querySelectorAll('.dir-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        selectedDir = d.name;
+        startBtn.disabled = false;
+        startBtn.textContent = '进入 「' + d.label + '」';
+      });
+      dirList.appendChild(card);
+    });
+    dirsLoaded = true;
+    startBtn.disabled = true;
+    startBtn.textContent = '请选择目录';
+    log('DIRS', data.dirs.length + ' dirs loaded');
+  } catch (e) {
+    log('DIRS', 'FAIL: ' + e.message);
+  }
+}
+
+async function createDir() {
+  const name = dirNewInput.value.trim();
+  if (!name) return;
+  dirNewBtn.disabled = true;
+  dirNewBtn.textContent = '...';
+  try {
+    const res = await fetch('/api/mkdir', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      log('MKDIR', 'ok: ' + name);
+      dirNewInput.value = '';
+      await loadDirs();
+      // auto-select the newly created dir
+      const card = dirList.querySelector('[data-name="' + CSS.escape(name) + '"]');
+      if (card) card.click();
+    } else {
+      log('MKDIR', 'FAIL: ' + (data.error || 'unknown'));
+      alert('创建失败: ' + (data.error || 'unknown'));
+    }
+  } catch (e) {
+    log('MKDIR', 'FAIL: ' + e.message);
+  }
+  dirNewBtn.disabled = false;
+  dirNewBtn.textContent = '创建';
+}
+
+// simple HTML escape
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 async function startClaude() {
+  if (!selectedDir) return;
   byteCount = 0;
   startBtn.disabled = true;
   startBtn.textContent = 'Starting...';
@@ -933,13 +1126,16 @@ async function startClaude() {
     clearInterval(ws._keepalive);
     ws._keepalive = null;
   }
-  try { await connectWS(); } catch (e) {
+  try { await connectWS(selectedDir); } catch (e) {
     log('START', 'FAIL: ' + e.message);
     startBtn.disabled = false;
-    startBtn.textContent = 'Start Claude Code';
+    startBtn.textContent = '请选择目录';
+    await loadDirs();  // refresh running status
   }
 }
 startBtn.addEventListener('click', startClaude);
+dirNewBtn.addEventListener('click', createDir);
+dirNewInput.addEventListener('keydown', e => { if (e.key === 'Enter') createDir(); });
 
 function wsReady() { return ws && ws.readyState === WebSocket.OPEN; }
 
@@ -1072,6 +1268,7 @@ function showMain() {
   mainScreen.style.display = 'flex';
   if (!term) initTerminal();
   startOverlay.style.display = 'flex';
+  if (!dirsLoaded) loadDirs();
   log('UI', 'main screen shown');
 }
 
