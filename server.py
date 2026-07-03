@@ -710,6 +710,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 .vk-btn.sym{background:#1a2a1a;color:#7ee787}
 .vk-btn.special{background:#1a1a2e;color:#a0a0d0}
 #btn-kbd{background:var(--warn);color:#000}
+#btn-copy{background:var(--green);color:#fff}
 </style>
 </head>
 <body>
@@ -751,6 +752,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     <button class="tb-btn tb-gray" id="btn-tab" data-key="tab">Tab</button>
     <button class="tb-btn tb-gray" id="btn-esc" data-key="esc">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
+    <button class="tb-btn" id="btn-copy">Copy</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
   <div id="vk-panel">
@@ -1172,6 +1174,22 @@ $('btn-kill').addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({type: 'kill'}));
     log('KILL', 'requested');
+  }
+});
+$('btn-copy').addEventListener('click', async () => {
+  const sel = term ? term.getSelection() : '';
+  if (!sel) { log('COPY', 'nothing selected'); return; }
+  try {
+    await navigator.clipboard.writeText(sel);
+    log('COPY', sel.length + ' chars copied');
+  } catch (e) {
+    log('COPY', 'FAIL: ' + e.message);
+    // fallback for older browsers
+    const ta = document.createElement('textarea');
+    ta.value = sel; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    log('COPY', 'fallback used');
   }
 });
 
