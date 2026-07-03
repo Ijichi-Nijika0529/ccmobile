@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=ccmobile
 WorkingDirectory=/opt/ccmobile
 EnvironmentFile=/opt/ccmobile/.env
 ExecStart=/usr/bin/python3 /opt/ccmobile/server.py
