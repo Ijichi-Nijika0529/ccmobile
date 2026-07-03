@@ -877,7 +877,6 @@ function initTerminal() {
     });
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
-    term.onSelectionChange(() => { _lastSelection = term.getSelection(); });
 // Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
 (() => {
   const vp = terminalContainer.querySelector('.xterm-viewport');
@@ -1177,6 +1176,11 @@ $('btn-kill').addEventListener('click', () => {
     ws.send(JSON.stringify({type: 'kill'}));
     log('KILL', 'requested');
   }
+});
+// Capture selection on mousedown (before terminal loses focus)
+$('btn-copy').addEventListener('mousedown', () => {
+  _lastSelection = term ? term.getSelection() : '';
+  if (!_lastSelection) _lastSelection = window.getSelection().toString();
 });
 $('btn-copy').addEventListener('click', () => {
   const sel = _lastSelection;
