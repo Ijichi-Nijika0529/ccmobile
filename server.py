@@ -802,6 +802,7 @@ window.onerror = (msg, src, line) => {
 
 let authenticated = false;
 let ws = null, term = null, fit = null, byteCount = 0;
+let _lastSelection = '';
 
 const $ = id => document.getElementById(id);
 const loginScreen = $('login-screen'), mainScreen = $('main-screen');
@@ -876,6 +877,7 @@ function initTerminal() {
     });
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
+    term.onSelectionChange(() => { _lastSelection = term.getSelection(); });
 // Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
 (() => {
   const vp = terminalContainer.querySelector('.xterm-viewport');
@@ -1177,7 +1179,7 @@ $('btn-kill').addEventListener('click', () => {
   }
 });
 $('btn-copy').addEventListener('click', () => {
-  const sel = term ? term.getSelection() : '';
+  const sel = _lastSelection;
   if (!sel) {
     log('COPY', 'nothing selected');
     const orig = $('btn-copy').textContent;
