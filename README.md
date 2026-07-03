@@ -1,6 +1,6 @@
 # CC Mobile
 
-轻量级手机端 Claude Code 远程控制工具。
+轻量级手机端 Claude Code 远程控制工具，使用Deepseekv4+ClaudeCode开发。
 
 ## 功能
 - 移动端 Web 终端（xterm.js）
