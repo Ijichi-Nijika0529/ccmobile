@@ -710,11 +710,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
 .vk-btn.sym{background:#1a2a1a;color:#7ee787}
 .vk-btn.special{background:#1a1a2e;color:#a0a0d0}
 #btn-kbd{background:var(--warn);color:#000}
-#btn-copy{background:var(--green);color:#fff}
-#ctx-menu{display:none;position:fixed;z-index:100;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:4px 0;min-width:120px;box-shadow:0 4px 12px rgba(0,0,0,.5)}
-.ctx-item{padding:8px 16px;font-size:13px;cursor:pointer;color:var(--text)}
-.ctx-item:hover{background:var(--accent);color:#fff}
-.ctx-item.disabled{opacity:.4;cursor:default;pointer-events:none}
 </style>
 </head>
 <body>
@@ -756,7 +751,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     <button class="tb-btn tb-gray" id="btn-tab" data-key="tab">Tab</button>
     <button class="tb-btn tb-gray" id="btn-esc" data-key="esc">Esc</button>
     <button class="tb-btn" id="btn-kbd">Kbd</button>
-    <button class="tb-btn" id="btn-copy">Copy</button>
     <button class="tb-btn tb-danger" id="btn-kill">Kill</button>
   </div>
   <div id="vk-panel">
@@ -791,11 +785,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
   <div id="debug-panel"></div>
 </div>
 
-<div id="ctx-menu">
-  <div class="ctx-item" id="ctx-copy">复制</div>
-  <div class="ctx-item" id="ctx-paste">粘贴</div>
-</div>
-
 <script>
 const dbg = [];
 function log(tag, msg) {
@@ -811,7 +800,6 @@ window.onerror = (msg, src, line) => {
 
 let authenticated = false;
 let ws = null, term = null, fit = null, byteCount = 0;
-let _lastSelection = '';
 
 const $ = id => document.getElementById(id);
 const loginScreen = $('login-screen'), mainScreen = $('main-screen');
@@ -887,13 +875,25 @@ function initTerminal() {
     term.onData(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
     term.onBinary(data => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); });
 
-    // Ctrl+C with selection → copy, without → pass through (SIGINT)
+    // ── clipboard: Ctrl+C copy + right-click copy ──
     term.attachCustomKeyEventHandler(e => {
-      if (e.type === 'keydown' && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key === 'c') {
-        const sel = term.getSelection();
-        if (sel) { copyToClipboard(sel); return false; }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && term.hasSelection()) {
+        navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+        return false;  // prevent sending ^C to PTY when copying
+      }
+      // Ctrl+Shift+C always copies (like standard terminals)
+      if ((e.ctrlKey && e.shiftKey) && e.key === 'C' && term.hasSelection()) {
+        navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+        return false;
       }
       return true;
+    });
+    terminalContainer.addEventListener('contextmenu', e => {
+      if (term.hasSelection()) {
+        e.preventDefault();
+        navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+        term.clearSelection();
+      }
     });
 
 // Batch wheel scroll in alternate screen to avoid per-tick WebSocket round-trip
@@ -1159,44 +1159,6 @@ startBtn.addEventListener('click', startClaude);
 dirNewBtn.addEventListener('click', createDir);
 dirNewInput.addEventListener('keydown', e => { if (e.key === 'Enter') createDir(); });
 
-// ── right-click context menu ──
-(() => {
-  const ctx = $('ctx-menu'), ctxCopy = $('ctx-copy'), ctxPaste = $('ctx-paste');
-  const vp = terminalContainer;
-  let _ctxSel = '';
-
-  vp.addEventListener('contextmenu', e => {
-    // only intercept right-click on the terminal area (not overlay)
-    if (e.target.closest('#start-overlay')) return;
-    e.preventDefault();
-    _ctxSel = term ? term.getSelection() : '';
-    if (_ctxSel) {
-      ctxCopy.classList.remove('disabled');
-    } else {
-      ctxCopy.classList.add('disabled');
-    }
-    ctx.style.display = 'block';
-    ctx.style.left = e.clientX + 'px';
-    ctx.style.top = e.clientY + 'px';
-  });
-
-  ctxCopy.addEventListener('click', () => {
-    if (_ctxSel) copyToClipboard(_ctxSel);
-    ctx.style.display = 'none';
-  });
-  ctxPaste.addEventListener('click', () => {
-    navigator.clipboard?.readText().then(t => {
-      if (t && ws && ws.readyState === WebSocket.OPEN) ws.send(t);
-    }).catch(() => {});
-    ctx.style.display = 'none';
-  });
-
-  document.addEventListener('click', e => {
-    if (!ctx.contains(e.target) && e.target !== vp) ctx.style.display = 'none';
-  });
-  window.addEventListener('blur', () => { ctx.style.display = 'none'; });
-})();
-
 function wsReady() { return ws && ws.readyState === WebSocket.OPEN; }
 
 function sendMsg() {
@@ -1228,46 +1190,11 @@ function wsSend(data) {
     if (data !== undefined) wsSend(data);
   });
 });
-function copyToClipboard(text) {
-  // execCommand works on HTTP, no secure-context needed
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.position = 'fixed'; ta.style.top = '-999px'; ta.style.left = '-999px';
-  ta.setAttribute('readonly', '');
-  document.body.appendChild(ta);
-  ta.focus(); ta.select();
-  let ok = false;
-  try { ok = document.execCommand('copy'); } catch(e) { log('COPY', 'execCommand: ' + e.message); }
-  document.body.removeChild(ta);
-  if (!ok) {
-    // fallback: clipboard API (needs HTTPS/localhost)
-    navigator.clipboard?.writeText(text).catch(e => log('COPY', 'clipboard: ' + e.message));
-  }
-  return ok;
-}
-
 $('btn-kill').addEventListener('click', () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({type: 'kill'}));
     log('KILL', 'requested');
   }
-});
-// Capture selection on mousedown (before terminal loses focus for toolbar btn)
-$('btn-copy').addEventListener('mousedown', () => {
-  _lastSelection = term ? term.getSelection() : '';
-  if (!_lastSelection) _lastSelection = window.getSelection().toString();
-});
-$('btn-copy').addEventListener('click', () => {
-  if (!_lastSelection) {
-    log('COPY', 'nothing selected');
-    $('btn-copy').textContent = '请先选择';
-    setTimeout(() => { $('btn-copy').textContent = 'Copy'; }, 1200);
-    return;
-  }
-  copyToClipboard(_lastSelection);
-  log('COPY', _lastSelection.length + ' chars');
-  $('btn-copy').textContent = 'Copied!';
-  setTimeout(() => { $('btn-copy').textContent = 'Copy'; }, 1000);
 });
 
 // ── virtual keyboard ──
