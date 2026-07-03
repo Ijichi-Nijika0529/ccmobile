@@ -1176,20 +1176,35 @@ $('btn-kill').addEventListener('click', () => {
     log('KILL', 'requested');
   }
 });
-$('btn-copy').addEventListener('click', async () => {
+$('btn-copy').addEventListener('click', () => {
   const sel = term ? term.getSelection() : '';
-  if (!sel) { log('COPY', 'nothing selected'); return; }
-  try {
-    await navigator.clipboard.writeText(sel);
+  if (!sel) {
+    log('COPY', 'nothing selected');
+    const orig = $('btn-copy').textContent;
+    $('btn-copy').textContent = '请先选择';
+    setTimeout(() => { $('btn-copy').textContent = orig; }, 1200);
+    return;
+  }
+  // execCommand is more reliable on HTTP (no secure-context requirement)
+  const ta = document.createElement('textarea');
+  ta.value = sel;
+  ta.style.position = 'fixed'; ta.style.top = '-999px'; ta.style.left = '-999px';
+  ta.setAttribute('readonly', '');
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) { log('COPY', 'execCommand fail: ' + e.message); }
+  document.body.removeChild(ta);
+  if (ok) {
     log('COPY', sel.length + ' chars copied');
-  } catch (e) {
-    log('COPY', 'FAIL: ' + e.message);
-    // fallback for older browsers
-    const ta = document.createElement('textarea');
-    ta.value = sel; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    document.execCommand('copy'); document.body.removeChild(ta);
-    log('COPY', 'fallback used');
+    $('btn-copy').textContent = 'Copied!';
+    setTimeout(() => { $('btn-copy').textContent = 'Copy'; }, 1000);
+  } else {
+    // last resort: clipboard API (needs HTTPS/localhost)
+    navigator.clipboard?.writeText(sel).then(
+      () => { log('COPY', 'clipboard API ok'); $('btn-copy').textContent = 'Copied!'; setTimeout(() => { $('btn-copy').textContent = 'Copy'; }, 1000); },
+      (e) => { log('COPY', 'all methods failed: ' + e.message); $('btn-copy').textContent = '失败'; setTimeout(() => { $('btn-copy').textContent = 'Copy'; }, 1200); }
+    );
   }
 });
 
