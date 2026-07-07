@@ -43,10 +43,44 @@ _ws_per_ip: dict[str, int] = {}
 _ws_per_ip_lock = asyncio.Lock()
 
 
+# ── accounts (multi-user support) ───────────────────────────────────
+def _load_accounts() -> dict | None:
+    """Load accounts.json if exists. Returns None for single-password mode."""
+    # Try production path first, then local
+    for path in ["/opt/ccmobile/accounts.json", "./accounts.json"]:
+        if Path(path).exists():
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"[ccmobile] Warning: failed to load {path}: {e}")
+    return None
+
+
+_accounts = _load_accounts()
+if _accounts:
+    print(f"[ccmobile] Multi-account mode: {len(_accounts)} accounts loaded")
+else:
+    print("[ccmobile] Single-password mode (no accounts.json found)")
+
+
 # ── token helpers ────────────────────────────────────────────────────
 
-def _hash_token(ts: str) -> str:
-    return hashlib.sha256(f"{PASSWORD}:{ts}:{_secret}".encode()).hexdigest()
+def _verify_password(password: str, hash_str: str) -> bool:
+    """Verify password against sha256:salt:hash format."""
+    try:
+        algo, salt, expected = hash_str.split(":", 2)
+        if algo != "sha256":
+            return False
+        actual = hashlib.sha256((salt + password).encode()).hexdigest()
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, AttributeError):
+        return False
+
+
+def _hash_token(username: str, ts: str) -> str:
+    """Generate HMAC for token. username can be empty for single-password mode."""
+    return hashlib.sha256(f"{PASSWORD}:{username}:{ts}:{_secret}".encode()).hexdigest()
 
 
 async def _check_rate(ip: str) -> bool:
@@ -61,21 +95,29 @@ async def _check_rate(ip: str) -> bool:
         return True
 
 
-def make_token() -> str:
+def make_token(username: str = "") -> str:
+    """Generate token. Format: username:timestamp:hmac"""
     ts = str(int(time.time()))
-    return f"{ts}:{_hash_token(ts)}"
+    return f"{username}:{ts}:{_hash_token(username, ts)}"
 
 
-def check_token(token: str) -> bool:
+def check_token(token: str) -> str | None:
+    """Validate token and return username (or empty string for single-password mode).
+    Returns None if invalid."""
     if not token:
-        return False
+        return None
     try:
-        ts_str, h = token.split(":", 2)[:2]
+        parts = token.split(":", 3)
+        if len(parts) < 3:
+            return None
+        username, ts_str, h = parts[0], parts[1], parts[2]
         if time.time() - int(ts_str) > TOKEN_EXPIRE:
-            return False
-        return secrets.compare_digest(h, _hash_token(ts_str))
-    except (ValueError, AttributeError):
-        return False
+            return None
+        if not secrets.compare_digest(h, _hash_token(username, ts_str)):
+            return None
+        return username  # can be empty string
+    except (ValueError, AttributeError, IndexError):
+        return None
 
 
 # ── session (one Claude process per working directory) ─────────────
@@ -83,6 +125,7 @@ def check_token(token: str) -> bool:
 @dataclasses.dataclass
 class Session:
     workdir: str
+    linux_user: str | None = None  # Linux user to run claude as (via sudo -u)
     pid: int | None = None
     fd: int | None = None
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
@@ -333,9 +376,9 @@ async def spawn_claude(session: Session) -> int:
 
         os.chdir(session.workdir)
 
-        # If CLAUDE_SUDO_USER is set, exec via sudo
-        if CLAUDE_SUDO_USER:
-            os.execvp("sudo", ["sudo", "-u", CLAUDE_SUDO_USER, "claude"])
+        # If session.linux_user is set, exec via sudo
+        if session.linux_user:
+            os.execvp("sudo", ["sudo", "-u", session.linux_user, "claude"])
         else:
             os.execvp("claude", ["claude"])
         os._exit(127)
@@ -390,9 +433,14 @@ async def kill_claude(session: Session) -> None:
             session.pid = None
 
 
-async def _get_or_create_session(dirname: str) -> Session | None:
+async def _get_or_create_session(dirname: str, linux_user: str | None, workdir_base: str) -> Session | None:
     """Look up or create a Session for the given directory name.
-    Validates the path is within WORKDIR. Returns None if invalid.
+    Validates the path is within workdir_base. Returns None if invalid.
+
+    Args:
+        dirname: Directory name (relative to workdir_base)
+        linux_user: Linux user to run claude as (None = no sudo)
+        workdir_base: Base working directory for this user
     """
     # Security: only take the last component of dirname, discard any path separators
     # This prevents path traversal attacks like "../../etc"
@@ -400,24 +448,24 @@ async def _get_or_create_session(dirname: str) -> Session | None:
 
     # Construct and resolve the full path
     if dirname_safe == ".":
-        workdir = WORKDIR
+        workdir = workdir_base
     else:
-        workdir = str((Path(WORKDIR) / dirname_safe).resolve())
+        workdir = str((Path(workdir_base) / dirname_safe).resolve())
 
-    # Verify the resolved path is within WORKDIR (defense in depth)
-    workdir_base = Path(WORKDIR).resolve()
+    # Verify the resolved path is within workdir_base (defense in depth)
+    workdir_base_path = Path(workdir_base).resolve()
     workdir_target = Path(workdir).resolve()
 
     try:
         # Python 3.9+ has is_relative_to, fallback for 3.8
         if hasattr(workdir_target, 'is_relative_to'):
-            if not workdir_target.is_relative_to(workdir_base):
+            if not workdir_target.is_relative_to(workdir_base_path):
                 return None
         else:
             # Fallback: check commonpath
-            if workdir_target != workdir_base:
-                common = Path(os.path.commonpath([workdir_base, workdir_target]))
-                if common != workdir_base:
+            if workdir_target != workdir_base_path:
+                common = Path(os.path.commonpath([workdir_base_path, workdir_target]))
+                if common != workdir_base_path:
                     return None
     except (ValueError, TypeError):
         return None
@@ -430,7 +478,11 @@ async def _get_or_create_session(dirname: str) -> Session | None:
         if key not in _sessions and len(_sessions) >= MAX_SESSIONS:
             return None
         if key not in _sessions:
-            _sessions[key] = Session(workdir=str(workdir_target), name=dirname_safe)
+            _sessions[key] = Session(
+                workdir=str(workdir_target),
+                linux_user=linux_user,
+                name=dirname_safe
+            )
         return _sessions[key]
 
 
@@ -471,7 +523,9 @@ def _check_origin(request: web.Request) -> bool:
 
 async def handle_login(request: web.Request) -> web.Response:
     peer = request.remote or "?"
-    if PASSWORD and not await _check_rate(peer):
+
+    # Rate limiting (applies to both modes)
+    if (PASSWORD or _accounts) and not await _check_rate(peer):
         print(f"[login] {peer} rate limited")
         await asyncio.sleep(2)
         return web.json_response({"error": "too many attempts"}, status=429)
@@ -482,6 +536,32 @@ async def handle_login(request: web.Request) -> web.Response:
         request.headers.get("X-Forwarded-Proto") == "https"
     )
 
+    # Multi-account mode
+    if _accounts:
+        try:
+            body = await request.json()
+            username = body.get("username", "").strip()
+            pw = body.get("password", "")
+        except (json.JSONDecodeError, AttributeError):
+            return web.json_response({"error": "bad request"}, status=400)
+
+        if not username or username not in _accounts:
+            await asyncio.sleep(1)
+            return web.json_response({"error": "invalid username or password"}, status=403)
+
+        account = _accounts[username]
+        if not _verify_password(pw, account["password_hash"]):
+            await asyncio.sleep(1)
+            return web.json_response({"error": "invalid username or password"}, status=403)
+
+        token = make_token(username)
+        resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE, "username": username})
+        resp.set_cookie("ccmobile_token", token, max_age=TOKEN_EXPIRE,
+                        httponly=True, samesite="Strict", secure=is_https)
+        print(f"[login] {peer} logged in as {username}")
+        return resp
+
+    # Single-password mode (backward compatible)
     if not PASSWORD:
         token = make_token()
         resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
@@ -503,28 +583,47 @@ async def handle_login(request: web.Request) -> web.Response:
 
 async def handle_check(request: web.Request) -> web.Response:
     token = _get_token(request)
-    if not PASSWORD:
-        return web.json_response({"valid": True})
-    return web.json_response({"valid": check_token(token)})
+    username = check_token(token)
+    if username is None:
+        return web.json_response({"valid": False})
+    return web.json_response({"valid": True, "username": username if username else None})
+
+
+async def handle_auth_mode(request: web.Request) -> web.Response:
+    """Return authentication mode: multi or single."""
+    return web.json_response({"mode": "multi" if _accounts else "single"})
 
 
 async def handle_dirs(request: web.Request) -> web.Response:
-    """List WORKDIR itself + direct subdirectories with running status."""
+    """List workdir + direct subdirectories with running status.
+    In multi-account mode, returns user's workdir. In single-password mode, returns WORKDIR."""
     token = _get_token(request)
-    if PASSWORD and not check_token(token):
+    username = check_token(token)
+    if username is None:
         return web.json_response({"error": "unauthorized"}, status=401)
 
+    # Determine base directory
+    if _accounts:
+        if not username:
+            return web.json_response({"error": "username required in multi-account mode"}, status=400)
+        account = _accounts.get(username)
+        if not account:
+            return web.json_response({"error": "unknown user"}, status=403)
+        workdir_base = account.get("workdir") or f"/home/{account['linux_user']}/workspace"
+    else:
+        workdir_base = WORKDIR
+
     dirs = []
-    # always include WORKDIR itself as "."
+    # always include workdir_base itself as "."
     dirs.append({
         "name": ".",
-        "label": Path(WORKDIR).name or "workspace",
-        "running": _is_session_running(_sessions.get(WORKDIR, Session(workdir=WORKDIR, name=".")))
-                     if WORKDIR in _sessions else False,
+        "label": Path(workdir_base).name or "workspace",
+        "running": _is_session_running(_sessions.get(workdir_base, Session(workdir=workdir_base, name=".")))
+                     if workdir_base in _sessions else False,
     })
 
     try:
-        entries = sorted(os.scandir(WORKDIR), key=lambda e: e.name.lower())
+        entries = sorted(os.scandir(workdir_base), key=lambda e: e.name.lower())
         for entry in entries:
             if not entry.is_dir():
                 continue
@@ -541,14 +640,26 @@ async def handle_dirs(request: web.Request) -> web.Response:
     except OSError:
         pass
 
-    return web.json_response({"parent": WORKDIR, "dirs": dirs})
+    return web.json_response({"parent": workdir_base, "dirs": dirs})
 
 
 async def handle_mkdir(request: web.Request) -> web.Response:
-    """Create a new subdirectory under WORKDIR."""
+    """Create a new subdirectory under workdir_base (user-specific in multi-account mode)."""
     token = _get_token(request)
-    if PASSWORD and not check_token(token):
+    username = check_token(token)
+    if username is None:
         return web.json_response({"error": "unauthorized"}, status=401)
+
+    # Determine base directory
+    if _accounts:
+        if not username:
+            return web.json_response({"error": "username required in multi-account mode"}, status=400)
+        account = _accounts.get(username)
+        if not account:
+            return web.json_response({"error": "unknown user"}, status=403)
+        workdir_base = account.get("workdir") or f"/home/{account['linux_user']}/workspace"
+    else:
+        workdir_base = WORKDIR
 
     try:
         body = await request.json()
@@ -564,7 +675,7 @@ async def handle_mkdir(request: web.Request) -> web.Response:
         if ch in name:
             return web.json_response({"error": "invalid name"}, status=400)
 
-    full = os.path.join(WORKDIR, name)
+    full = os.path.join(workdir_base, name)
     try:
         Path(full).mkdir(parents=False, exist_ok=True)
     except OSError as e:
@@ -590,14 +701,33 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     token = _get_token(request)
     dirname = (request.query.get("dir") or ".").strip()
-    print(f"[ws] {peer} connect dir={dirname}")
 
-    if PASSWORD and not check_token(token):
+    # Validate token and extract username
+    username = check_token(token)
+    if username is None:
         print(f"[ws] {peer} bad token")
         return await _ws_error(request, "invalid token")
 
+    # Determine linux_user and workdir_base based on mode
+    if _accounts:
+        if not username:
+            print(f"[ws] {peer} multi-account mode requires username")
+            return await _ws_error(request, "Multi-account mode requires username")
+        account = _accounts.get(username)
+        if not account:
+            print(f"[ws] {peer} unknown user: {username}")
+            return await _ws_error(request, f"Unknown user: {username}")
+        linux_user = account["linux_user"]
+        workdir_base = account.get("workdir") or f"/home/{linux_user}/workspace"
+        print(f"[ws] {peer} user={username} dir={dirname} (multi-account mode)")
+    else:
+        # Single-password mode (backward compatible)
+        linux_user = CLAUDE_SUDO_USER if CLAUDE_SUDO_USER else None
+        workdir_base = WORKDIR
+        print(f"[ws] {peer} dir={dirname} (single-password mode)")
+
     # Get or create session for this directory
-    session = await _get_or_create_session(dirname)
+    session = await _get_or_create_session(dirname, linux_user, workdir_base)
     if session is None:
         print(f"[ws] {peer} invalid dir or session limit: {dirname}")
         return await _ws_error(request, "Invalid directory or session limit reached")
@@ -628,7 +758,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     ws = web.WebSocketResponse(heartbeat=45, compress=False)
     await ws.prepare(request)
-    print(f"[ws] {peer} {session.name} PID={session.pid} fd={session.fd}")
+    print(f"[ws] {peer} {session.name} PID={session.pid} fd={session.fd} user={session.linux_user or 'none'}")
 
     # Replay PTY history
     if session.ring:
@@ -703,6 +833,7 @@ app = web.Application()
 app.router.add_get("/", handle_index)
 app.router.add_post("/login", handle_login)
 app.router.add_get("/check", handle_check)
+app.router.add_get("/api/auth-mode", handle_auth_mode)
 app.router.add_get("/api/dirs", handle_dirs)
 app.router.add_post("/api/mkdir", handle_mkdir)
 app.router.add_get("/ws", handle_ws)
@@ -717,292 +848,90 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#1a1612">
+<meta name="theme-color" content="#0d1117">
 <title>CC Mobile</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  color-scheme:dark;
-  --bg:#1a1612;
-  --surface:#2a2420;
-  --surface-elevated:#352f2a;
-  --border:#3a3530;
-  --text:#e8e3d8;
-  --text-dim:#a59a88;
-  --accent:#c4612f;
-  --accent-hover:#a94e22;
-  --danger:#d8533a;
-  --green:#7fb069;
-  --green-bright:#96c97f;
-  --warn:#d4a84f;
-  --glow-accent:rgba(196,97,47,0.4);
-  --glow-green:rgba(127,176,105,0.4);
-}
+:root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#58a6ff;--danger:#f85149;--green:#3fb950;--warn:#d29922}
 html,body{height:100%;overflow:hidden;background:var(--bg)}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-  color:var(--text);display:flex;flex-direction:column;
-  -webkit-tap-highlight-color:transparent;
-  letter-spacing:0.01em;
-}
-#login-screen{
-  display:none;flex-direction:column;align-items:center;
-  justify-content:center;height:100%;padding:24px;gap:24px;
-}
-#login-screen h1{
-  font-size:28px;font-weight:700;letter-spacing:-0.02em;
-  background:linear-gradient(135deg,var(--accent),var(--warn));
-  -webkit-background-clip:text;background-clip:text;
-  -webkit-text-fill-color:transparent;
-}
-#login-screen input{
-  width:100%;max-width:340px;padding:14px 18px;
-  background:var(--surface);border:2px solid var(--border);
-  border-radius:14px;color:var(--text);font-size:16px;outline:none;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 2px 8px rgba(0,0,0,0.15);
-}
-#login-screen input:focus,#input-row input:focus{
-  border-color:var(--accent);
-  box-shadow:0 4px 16px var(--glow-accent),0 2px 8px rgba(0,0,0,0.2);
-  transform:translateY(-1px);
-}
-#login-btn{
-  padding:14px 32px;background:var(--accent);color:#fff;
-  border:none;border-radius:14px;font-size:17px;font-weight:700;
-  cursor:pointer;width:100%;max-width:340px;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 4px 12px var(--glow-accent),0 2px 6px rgba(0,0,0,0.2);
-}
-#login-btn:hover{
-  background:var(--accent-hover);
-  transform:translateY(-2px);
-  box-shadow:0 6px 20px var(--glow-accent),0 3px 10px rgba(0,0,0,0.25);
-}
-#login-error{color:var(--danger);font-size:14px;min-height:20px;font-weight:500}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--text);display:flex;flex-direction:column;-webkit-tap-highlight-color:transparent}
+#login-screen{display:none;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:24px;gap:20px}
+#login-screen h1{font-size:22px;font-weight:600}
+#login-screen input{width:100%;max-width:320px;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;outline:none}
+#login-screen input:focus,#input-row input:focus{border-color:var(--accent)}
+#login-btn{padding:12px 28px;background:var(--accent);color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;width:100%;max-width:320px}
+#login-error{color:var(--danger);font-size:14px;min-height:20px}
 #main-screen{display:none;flex-direction:column;height:100%}
-#status-bar{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:8px 14px;background:rgba(42,36,32,0.85);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  border-bottom:1px solid var(--border);font-size:12px;flex-shrink:0;
-  box-shadow:0 1px 4px rgba(0,0,0,0.1);
-}
-#status-dot{
-  width:10px;height:10px;border-radius:50%;
-  background:var(--danger);flex-shrink:0;
-  transition:all 0.3s ease;
-  box-shadow:0 0 0 rgba(216,83,58,0);
-}
-#status-dot.on{
-  background:var(--green-bright);
-  box-shadow:0 0 12px var(--glow-green),0 0 4px var(--glow-green);
-  animation:pulse 2s ease-in-out infinite;
-}
-@keyframes pulse{
-  0%,100%{box-shadow:0 0 12px var(--glow-green),0 0 4px var(--glow-green)}
-  50%{box-shadow:0 0 20px var(--glow-green),0 0 8px var(--glow-green)}
-}
-#status-left{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
-#status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
-#logout-btn{
-  font-size:11px;background:var(--border);color:var(--text);
-  border:none;padding:5px 12px;border-radius:8px;cursor:pointer;
-  font-weight:600;transition:all 0.2s ease;
-}
-#logout-btn:hover{background:var(--surface-elevated);transform:translateY(-1px)}
+#status-bar{display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:var(--surface);border-bottom:1px solid var(--border);font-size:11px;flex-shrink:0}
+#status-dot{width:8px;height:8px;border-radius:50%;background:var(--danger);flex-shrink:0}
+#status-dot.on{background:var(--green)}
+#status-left{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
+#status-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#logout-btn{font-size:10px;background:var(--border);color:var(--text);border:none;padding:4px 10px;border-radius:5px;cursor:pointer}
 #terminal-container{flex:1;overflow:hidden;min-height:0;position:relative;user-select:text;-webkit-user-select:text}
 #terminal-container .xterm{position:absolute;left:0;bottom:0;user-select:text;-webkit-user-select:text}
-.xterm-viewport::-webkit-scrollbar{width:6px}
-.xterm-viewport::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.xterm-viewport::-webkit-scrollbar-thumb:hover{background:var(--surface-elevated)}
-#start-overlay{
-  position:absolute;inset:0;z-index:10;display:flex;
-  flex-direction:column;align-items:center;justify-content:flex-start;
-  background:var(--bg);gap:16px;padding:28px 18px;overflow-y:auto;
-}
-#start-overlay h2{
-  font-size:18px;font-weight:700;margin-bottom:6px;
-  letter-spacing:-0.01em;color:var(--text);
-}
-#dir-list{width:100%;max-width:380px;display:flex;flex-direction:column;gap:10px}
-.dir-card{
-  display:flex;align-items:center;gap:12px;padding:14px 16px;
-  background:var(--surface);border:2px solid var(--border);
-  border-radius:14px;cursor:pointer;text-align:left;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 2px 8px rgba(0,0,0,0.12);
-}
-.dir-card:hover{
-  transform:translateY(-2px) scale(1.01);
-  box-shadow:0 6px 20px rgba(0,0,0,0.2);
-  border-color:var(--surface-elevated);
-}
-.dir-card.selected{
-  border-color:var(--accent);
-  box-shadow:0 4px 16px var(--glow-accent),0 2px 8px rgba(0,0,0,0.15);
-  background:var(--surface-elevated);
-}
+.xterm-viewport::-webkit-scrollbar{width:4px}
+.xterm-viewport::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+#start-overlay{position:absolute;inset:0;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;background:var(--bg);gap:10px;padding:20px 16px;overflow-y:auto}
+#start-overlay h2{font-size:16px;font-weight:600;margin-bottom:4px}
+#dir-list{width:100%;max-width:360px;display:flex;flex-direction:column;gap:6px}
+.dir-card{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--surface);border:2px solid var(--border);border-radius:10px;cursor:pointer;transition:border-color .15s;text-align:left}
+.dir-card.selected{border-color:var(--accent)}
 .dir-card.running{border-color:var(--green)}
 .dir-card.running.selected{border-color:var(--accent)}
-.dir-icon{font-size:26px;flex-shrink:0;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.2))}
+.dir-icon{font-size:22px;flex-shrink:0}
 .dir-info{flex:1;min-width:0}
-.dir-name{
-  font-size:15px;font-weight:700;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap;letter-spacing:-0.01em;
-}
-.dir-status{font-size:12px;margin-top:3px;font-weight:500}
-.dir-status.stopped{color:var(--text-dim)}
-.dir-status.running{color:var(--green-bright)}
-.dir-status .dot{
-  display:inline-block;width:7px;height:7px;border-radius:50%;
-  margin-right:5px;vertical-align:middle;
-}
-.dir-status .dot.running{
-  background:var(--green-bright);
-  box-shadow:0 0 8px var(--glow-green);
-}
+.dir-name{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dir-status{font-size:11px;margin-top:2px}
+.dir-status.stopped{color:var(--text);opacity:.5}
+.dir-status.running{color:var(--green)}
+.dir-status .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.dir-status .dot.running{background:var(--green)}
 .dir-status .dot.stopped{background:var(--border)}
-#dir-new{width:100%;max-width:380px;display:flex;gap:8px}
-#dir-new-input{
-  flex:1;padding:12px 14px;background:var(--surface);
-  border:2px solid var(--border);border-radius:12px;color:var(--text);
-  font-size:14px;outline:none;min-width:0;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 2px 6px rgba(0,0,0,0.1);
-}
-#dir-new-input:focus{
-  border-color:var(--accent);
-  box-shadow:0 4px 12px var(--glow-accent);
-  transform:translateY(-1px);
-}
-#dir-new-btn{
-  padding:12px 20px;background:var(--surface-elevated);
-  color:var(--text);border:none;border-radius:12px;
-  font-size:14px;font-weight:700;cursor:pointer;flex-shrink:0;
-  transition:all 0.2s ease;box-shadow:0 2px 6px rgba(0,0,0,0.1);
-}
-#dir-new-btn:hover{
-  background:var(--border);transform:translateY(-1px);
-  box-shadow:0 4px 12px rgba(0,0,0,0.15);
-}
-#start-btn{
-  padding:16px 40px;background:var(--accent);color:#fff;
-  border:none;border-radius:16px;font-size:17px;font-weight:700;
-  cursor:pointer;min-width:220px;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 6px 20px var(--glow-accent),0 3px 10px rgba(0,0,0,0.2);
-}
-#start-btn:hover:not(:disabled){
-  background:var(--accent-hover);
-  transform:translateY(-2px);
-  box-shadow:0 8px 28px var(--glow-accent),0 4px 14px rgba(0,0,0,0.25);
-}
-#start-btn:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
-#toolbar{
-  display:flex;gap:5px;padding:8px 10px;
-  background:rgba(42,36,32,0.85);backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);border-top:1px solid var(--border);
-  flex-shrink:0;justify-content:center;flex-wrap:wrap;
-  box-shadow:0 -1px 4px rgba(0,0,0,0.1);
-}
-.tb-btn{
-  padding:9px 12px;font-size:12px;border-radius:10px;
-  text-align:center;border:none;font-weight:700;cursor:pointer;
-  color:#fff;transition:all 0.2s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 2px 6px rgba(0,0,0,0.15);
-}
-.tb-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.25)}
+#dir-new{width:100%;max-width:360px;display:flex;gap:6px}
+#dir-new-input{flex:1;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;outline:none;min-width:0}
+#dir-new-input:focus{border-color:var(--accent)}
+#dir-new-btn{padding:10px 16px;background:var(--border);color:var(--text);border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0}
+#start-btn{padding:14px 32px;background:var(--accent);color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;min-width:200px}
+#start-btn:disabled{opacity:.5;cursor:default}
+#toolbar{display:flex;gap:4px;padding:6px 8px;background:var(--surface);border-top:1px solid var(--border);flex-shrink:0;justify-content:center;flex-wrap:wrap}
+.tb-btn{padding:8px 10px;font-size:12px;border-radius:6px;text-align:center;border:none;font-weight:600;cursor:pointer;color:#fff}
 .tb-accent{background:var(--accent)}
-.tb-accent:hover{background:var(--accent-hover)}
 .tb-danger{background:var(--danger)}
-.tb-danger:hover{background:#c2452e}
 .tb-gray{background:var(--border);color:var(--text)}
-.tb-gray:hover{background:var(--surface-elevated)}
-.tb-enter{background:var(--green);flex:2;max-width:130px}
-.tb-enter:hover{background:var(--green-bright)}
-#input-row{
-  display:flex;gap:6px;padding:6px 10px 10px;
-  background:var(--surface);flex-shrink:0;
-}
-#input-row input{
-  flex:1;padding:11px 14px;background:var(--bg);
-  border:2px solid var(--border);border-radius:12px;
-  color:var(--text);font-size:14px;outline:none;min-width:0;
-  transition:all 0.25s cubic-bezier(0.4,0,0.2,1);
-  box-shadow:0 2px 6px rgba(0,0,0,0.1);
-}
-#send-btn{
-  padding:11px 20px;background:var(--accent);color:#fff;
-  border:none;border-radius:12px;font-size:14px;font-weight:700;
-  cursor:pointer;flex-shrink:0;
-  transition:all 0.2s ease;
-  box-shadow:0 3px 10px var(--glow-accent);
-}
-#send-btn:hover{
-  background:var(--accent-hover);transform:translateY(-1px);
-  box-shadow:0 5px 16px var(--glow-accent);
-}
-#debug-panel{
-  display:none;background:#0d0b09;color:var(--warn);
-  font-size:10px;padding:6px 10px;max-height:90px;
-  overflow-y:auto;flex-shrink:0;font-family:monospace;
-  border-top:1px solid var(--border);
-}
-#login-btn:active,#start-btn:active,.tb-btn:active,#send-btn:active,.vk-btn:active{opacity:.75;transform:scale(0.98)}
+.tb-enter{background:var(--green);flex:2;max-width:120px}
+#input-row{display:flex;gap:4px;padding:4px 8px 8px;background:var(--surface);flex-shrink:0}
+#input-row input{flex:1;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none;min-width:0}
+#send-btn{padding:10px 16px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;flex-shrink:0}
+#debug-panel{display:none;background:#000;color:var(--warn);font-size:10px;padding:4px 8px;max-height:80px;overflow-y:auto;flex-shrink:0;font-family:monospace;border-top:1px solid var(--border)}
+#login-btn:active,#start-btn:active,.tb-btn:active,#send-btn:active,.vk-btn:active{opacity:.7}
 /* virtual keyboard */
-#vk-panel{
-  display:none;flex-shrink:0;background:var(--surface);
-  border-top:1px solid var(--border);padding:6px 6px;
-  max-height:45vh;overflow-y:auto;
-}
-.vk-row{display:flex;gap:3px;justify-content:center;flex-wrap:wrap;margin:2px 0}
-.vk-btn{
-  min-width:28px;height:34px;padding:4px 6px;font-size:12px;
-  border-radius:8px;border:none;font-weight:700;cursor:pointer;
-  color:var(--text);background:var(--border);text-align:center;
-  line-height:26px;transition:all 0.15s ease;
-  box-shadow:0 2px 4px rgba(0,0,0,0.12);
-}
-.vk-btn:hover{transform:translateY(-1px);box-shadow:0 3px 8px rgba(0,0,0,0.2)}
-.vk-btn.mod{min-width:46px;font-size:11px;border-radius:9px}
-.vk-mod-ctrl{background:#2a4a6a;color:#6fa8dc}
-.vk-mod-alt{background:#3a2a4a;color:#c896ff}
-.vk-mod-shift{background:#2a4a3a;color:#7fb069}
-.vk-mod-ctrl.on{
-  background:#6fa8dc;color:#fff;
-  box-shadow:0 0 12px rgba(111,168,220,0.5),0 3px 8px rgba(0,0,0,0.2);
-}
-.vk-mod-alt.on{
-  background:#c896ff;color:#fff;
-  box-shadow:0 0 12px rgba(200,150,255,0.5),0 3px 8px rgba(0,0,0,0.2);
-}
-.vk-mod-shift.on{
-  background:#7fb069;color:#fff;
-  box-shadow:0 0 12px rgba(127,176,105,0.5),0 3px 8px rgba(0,0,0,0.2);
-}
-.vk-mod-tab{background:#2a4a4a;color:#56d4dd}
-.vk-mod-tab.on{
-  background:#56d4dd;color:#0d0b09;
-  box-shadow:0 0 12px rgba(86,212,221,0.5),0 3px 8px rgba(0,0,0,0.2);
-}
-.vk-btn.sym{background:#2a3a2a;color:#96c97f}
-.vk-btn.special{background:#2a2a3a;color:#b0b0d0}
-#btn-kbd{
-  background:var(--warn);color:#0d0b09;font-weight:800;
-  box-shadow:0 3px 10px rgba(212,168,79,0.4);
-}
-#btn-kbd:hover{background:#e0b858}
+#vk-panel{display:none;flex-shrink:0;background:var(--surface);border-top:1px solid var(--border);padding:3px 4px;max-height:45vh;overflow-y:auto}
+.vk-row{display:flex;gap:2px;justify-content:center;flex-wrap:wrap;margin:1px 0}
+.vk-btn{min-width:26px;height:30px;padding:3px 5px;font-size:11px;border-radius:4px;border:none;font-weight:600;cursor:pointer;color:var(--text);background:var(--border);text-align:center;line-height:24px}
+.vk-btn.mod{min-width:42px;font-size:10px;border-radius:5px}
+.vk-mod-ctrl{background:#1a3a5c;color:#58a6ff}
+.vk-mod-alt{background:#2d1a3c;color:#bc8cff}
+.vk-mod-shift{background:#1a3c2d;color:#3fb950}
+.vk-mod-ctrl.on{background:#58a6ff;color:#fff;outline:2px solid #80bfff}
+.vk-mod-alt.on{background:#bc8cff;color:#fff;outline:2px solid #d2a8ff}
+.vk-mod-shift.on{background:#3fb950;color:#fff;outline:2px solid #70d970}
+.vk-mod-tab{background:#1a3c3c;color:#56d4dd}
+.vk-mod-tab.on{background:#56d4dd;color:#000;outline:2px solid #80e8e8}
+.vk-btn.sym{background:#1a2a1a;color:#7ee787}
+.vk-btn.special{background:#1a1a2e;color:#a0a0d0}
+#btn-kbd{background:var(--warn);color:#000}
 </style>
 </head>
 <body>
 
 <div id="login-screen">
   <h1>CC Mobile</h1>
-  <input id="pw-input" type="password" placeholder="Password" enterkeyhint="go" autocomplete="off">
+  <input id="username-input" type="text" placeholder="Username" enterkeyhint="next" autocomplete="username" style="display:none">
+  <input id="pw-input" type="password" placeholder="Password" enterkeyhint="go" autocomplete="current-password">
   <button id="login-btn">Connect</button>
   <span id="login-error"></span>
 </div>
@@ -1086,10 +1015,12 @@ window.onerror = (msg, src, line) => {
 
 let authenticated = false;
 let ws = null, term = null, fit = null, byteCount = 0;
+let authMode = 'single';  // 'single' or 'multi'
+let currentUser = null;
 
 const $ = id => document.getElementById(id);
 const loginScreen = $('login-screen'), mainScreen = $('main-screen');
-const pwInput = $('pw-input'), loginBtn = $('login-btn'), loginError = $('login-error');
+const usernameInput = $('username-input'), pwInput = $('pw-input'), loginBtn = $('login-btn'), loginError = $('login-error');
 const statusDot = $('status-dot'), statusText = $('status-text');
 const terminalContainer = $('terminal-container');
 const startOverlay = $('start-overlay'), startBtn = $('start-btn');
@@ -1097,17 +1028,38 @@ const dirList = $('dir-list'), dirNewInput = $('dir-new-input'), dirNewBtn = $('
 let selectedDir = null, dirsLoaded = false;
 const msgInput = $('msg-input'), sendBtn = $('send-btn');
 
-async function tryLogin(pw) {
+async function checkAuthMode() {
+  try {
+    const res = await fetch('/api/auth-mode');
+    const data = await res.json();
+    authMode = data.mode || 'single';
+    log('AUTH', 'mode: ' + authMode);
+    if (authMode === 'multi') {
+      usernameInput.style.display = 'block';
+      usernameInput.placeholder = 'Username';
+      pwInput.setAttribute('enterkeyhint', 'go');
+      usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') pwInput.focus(); });
+    }
+  } catch (e) {
+    log('AUTH', 'checkAuthMode failed: ' + e.message);
+  }
+}
+
+async function tryLogin(username, pw) {
   log('AUTH', 'logging in...');
+  const body = authMode === 'multi'
+    ? {username: username, password: pw}
+    : {password: pw};
   const res = await fetch('/login', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({password: pw})
+    body: JSON.stringify(body)
   });
   const data = await res.json();
   if (res.ok) {
     authenticated = true;
-    log('AUTH', 'OK, expires in ' + data.expires + 's');
+    currentUser = data.username || null;
+    log('AUTH', 'OK, expires in ' + data.expires + 's' + (currentUser ? ', user=' + currentUser : ''));
     return true;
   }
   throw new Error(data.error || 'Login failed');
@@ -1116,14 +1068,23 @@ async function tryLogin(pw) {
 async function checkToken() {
   const res = await fetch('/check');
   const data = await res.json();
-  log('AUTH', 'token check: ' + data.valid);
+  log('AUTH', 'token check: ' + data.valid + (data.username ? ', user=' + data.username : ''));
+  if (data.valid) {
+    currentUser = data.username || null;
+  }
   return data.valid;
 }
 
 async function doLogin() {
   loginError.textContent = '';
   try {
-    if (await tryLogin(pwInput.value)) showMain();
+    const username = authMode === 'multi' ? usernameInput.value.trim() : '';
+    const pw = pwInput.value;
+    if (authMode === 'multi' && !username) {
+      loginError.textContent = 'Username required';
+      return;
+    }
+    if (await tryLogin(username, pw)) showMain();
   } catch (e) {
     loginError.textContent = e.message;
     log('AUTH', 'FAIL: ' + e.message);
@@ -1140,13 +1101,13 @@ function initTerminal() {
       cursorBlink: true, cursorStyle: 'bar', fontSize: 13,
       fontFamily: "'JetBrains Mono','Fira Code','Cascadia Code',Menlo,monospace",
       theme: {
-        background: '#1a1612', foreground: '#e8e3d8',
-        cursor: '#c4612f', selectionBackground: '#3a3530',
-        black: '#3a3530', red: '#d8533a', green: '#7fb069', yellow: '#d4a84f',
-        blue: '#6fa8dc', magenta: '#c896ff', cyan: '#56d4dd', white: '#a59a88',
-        brightBlack: '#4a453f', brightRed: '#e86f5a', brightGreen: '#96c97f',
-        brightYellow: '#e0b858', brightBlue: '#8bbfea', brightMagenta: '#d8b0ff',
-        brightCyan: '#70e0e8', brightWhite: '#e8e3d8'
+        background: '#0d1117', foreground: '#c9d1d9',
+        cursor: '#58a6ff', selectionBackground: '#264f78',
+        black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
+        blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
+        brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
+        brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+        brightCyan: '#56d4dd', brightWhite: '#f0f6fc'
       },
       scrollback: 5000,
       smoothScrollDuration: 0
@@ -1577,10 +1538,15 @@ function showMain() {
   if (!term) initTerminal();
   startOverlay.style.display = 'flex';
   if (!dirsLoaded) loadDirs();
-  log('UI', 'main screen shown');
+  // Update status text with username in multi-account mode
+  if (currentUser) {
+    statusText.textContent = 'User: ' + currentUser;
+  }
+  log('UI', 'main screen shown' + (currentUser ? ', user=' + currentUser : ''));
 }
 
 (async function init() {
+  await checkAuthMode();
   if (await checkToken()) { authenticated = true; showMain(); return; }
   authenticated = false;
   loginScreen.style.display = 'flex';
@@ -1617,4 +1583,16 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    # CLI tool: generate password hash
+    if len(sys.argv) > 1 and sys.argv[1] == "hash-password":
+        import getpass
+        password = getpass.getpass("Enter password: ")
+        salt = secrets.token_hex(8)
+        hash_value = hashlib.sha256((salt + password).encode()).hexdigest()
+        print(f"Salt: {salt}")
+        print(f"Hash: sha256:{salt}:{hash_value}")
+        print(f"\nAdd to accounts.json:")
+        print(f'"password_hash": "sha256:{salt}:{hash_value}"')
+        sys.exit(0)
     main()
