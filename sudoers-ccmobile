@@ -1,0 +1,8 @@
+# ccmobile sudo configuration
+# Allow ccmobile user to spawn claude as other users without password
+
+# Allow ccmobile to run claude as any user
+ccmobile ALL=(ALL) NOPASSWD: /usr/local/bin/claude, /usr/bin/claude
+
+# If you want to restrict to specific users, use:
+# ccmobile ALL=(yachiyo,root) NOPASSWD: /usr/local/bin/claude, /usr/bin/claude

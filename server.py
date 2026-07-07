@@ -28,12 +28,19 @@ WS_MSG_MAX = 1_048_576       # 1MB max per WebSocket message
 WS_IDLE_TIMEOUT = 1800        # 30min idle → close
 LOGIN_RATE_LIMIT = 5          # max attempts per window
 LOGIN_RATE_WINDOW = 60        # seconds
+WS_PER_IP_LIMIT = 3           # max concurrent WS connections per IP
+MAX_SESSIONS = 5              # max total active sessions
+CLAUDE_SUDO_USER = os.environ.get("CCMOBILE_CLAUDE_USER", "")  # if set, spawn claude via sudo -u
 
 _secret = secrets.token_hex(32)
 
 # rate limiter: {ip: [(ts1, ts2, ...)]}
 _rate_log: dict[str, list[float]] = {}
 _rate_lock = asyncio.Lock()
+
+# WS per-IP connection tracking: {ip: count}
+_ws_per_ip: dict[str, int] = {}
+_ws_per_ip_lock = asyncio.Lock()
 
 
 # ── token helpers ────────────────────────────────────────────────────
@@ -120,6 +127,28 @@ def _add_client(session: Session, ws: "web.WebSocketResponse") -> None:
 def _remove_client(session: Session, ws: "web.WebSocketResponse") -> None:
     """Unregister a WebSocket client. Does NOT kill Claude."""
     session.clients.discard(ws)
+
+
+async def _ws_connect_allowed(ip: str) -> bool:
+    """Check if this IP can open another WebSocket connection."""
+    async with _ws_per_ip_lock:
+        return _ws_per_ip.get(ip, 0) < WS_PER_IP_LIMIT
+
+
+async def _ws_track_connect(ip: str) -> None:
+    """Increment WS connection count for this IP."""
+    async with _ws_per_ip_lock:
+        _ws_per_ip[ip] = _ws_per_ip.get(ip, 0) + 1
+
+
+async def _ws_track_disconnect(ip: str) -> None:
+    """Decrement WS connection count for this IP."""
+    async with _ws_per_ip_lock:
+        count = _ws_per_ip.get(ip, 0)
+        if count > 0:
+            _ws_per_ip[ip] = count - 1
+        if _ws_per_ip.get(ip, 0) == 0:
+            _ws_per_ip.pop(ip, None)
 
 
 # ── PTY write helper ─────────────────────────────────────────────────
@@ -296,10 +325,19 @@ async def spawn_claude(session: Session) -> int:
 
     pid, fd = pty.fork()
     if pid == 0:
-        for k in ("CCMOBILE_PASSWORD", "CCMOBILE_ACCOUNTS"):
-            os.environ.pop(k, None)
+        # Child process
+        # Clear sensitive environment variables
+        for k in list(os.environ.keys()):
+            if k not in ("PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL"):
+                os.environ.pop(k, None)
+
         os.chdir(session.workdir)
-        os.execvp("claude", ["claude"])
+
+        # If CLAUDE_SUDO_USER is set, exec via sudo
+        if CLAUDE_SUDO_USER:
+            os.execvp("sudo", ["sudo", "-u", CLAUDE_SUDO_USER, "claude"])
+        else:
+            os.execvp("claude", ["claude"])
         os._exit(127)
     else:
         session.pid = pid
@@ -344,7 +382,11 @@ async def kill_claude(session: Session) -> None:
             _safe(os.kill, pid, 15)
             await asyncio.sleep(0.3)
             _safe(os.kill, pid, 9)
-            _safe(os.waitpid, pid, 0)
+            # waitpid with proper error handling
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass  # already reaped
             session.pid = None
 
 
@@ -352,19 +394,43 @@ async def _get_or_create_session(dirname: str) -> Session | None:
     """Look up or create a Session for the given directory name.
     Validates the path is within WORKDIR. Returns None if invalid.
     """
-    # resolve to absolute, verify it's under WORKDIR
-    workdir = WORKDIR if dirname == "." else os.path.join(WORKDIR, dirname)
-    workdir = str(Path(workdir).resolve())
+    # Security: only take the last component of dirname, discard any path separators
+    # This prevents path traversal attacks like "../../etc"
+    dirname_safe = Path(dirname).name if dirname != "." else "."
 
-    if not workdir.startswith(WORKDIR + os.sep) and workdir != WORKDIR:
+    # Construct and resolve the full path
+    if dirname_safe == ".":
+        workdir = WORKDIR
+    else:
+        workdir = str((Path(WORKDIR) / dirname_safe).resolve())
+
+    # Verify the resolved path is within WORKDIR (defense in depth)
+    workdir_base = Path(WORKDIR).resolve()
+    workdir_target = Path(workdir).resolve()
+
+    try:
+        # Python 3.9+ has is_relative_to, fallback for 3.8
+        if hasattr(workdir_target, 'is_relative_to'):
+            if not workdir_target.is_relative_to(workdir_base):
+                return None
+        else:
+            # Fallback: check commonpath
+            if workdir_target != workdir_base:
+                common = Path(os.path.commonpath([workdir_base, workdir_target]))
+                if common != workdir_base:
+                    return None
+    except (ValueError, TypeError):
         return None
 
-    # Use canonical key for dedup
-    key = workdir
+    # Use canonical path as key for dedup
+    key = str(workdir_target)
 
     async with _sessions_lock:
+        # Check global session limit
+        if key not in _sessions and len(_sessions) >= MAX_SESSIONS:
+            return None
         if key not in _sessions:
-            _sessions[key] = Session(workdir=workdir, name=dirname)
+            _sessions[key] = Session(workdir=str(workdir_target), name=dirname_safe)
         return _sessions[key]
 
 
@@ -505,13 +571,18 @@ async def handle_mkdir(request: web.Request) -> web.Response:
 # ── WebSocket handler ────────────────────────────────────────────────
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+    peer = request.remote or "?"
+
+    # Check per-IP WS connection limit
+    if not await _ws_connect_allowed(peer):
+        print(f"[ws] {peer} connection limit exceeded ({WS_PER_IP_LIMIT} per IP)")
+        return await _ws_error(request, f"Too many connections from your IP (max {WS_PER_IP_LIMIT})")
+
     if not _check_origin(request):
-        peer = request.remote or "?"
         print(f"[ws] {peer} bad origin: {request.headers.get('Origin', '?')}")
         return await _ws_error(request, "origin not allowed")
 
     token = _get_token(request)
-    peer = request.remote or "?"
     dirname = (request.query.get("dir") or ".").strip()
     print(f"[ws] {peer} connect dir={dirname}")
 
@@ -522,8 +593,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     # Get or create session for this directory
     session = await _get_or_create_session(dirname)
     if session is None:
-        print(f"[ws] {peer} invalid dir: {dirname}")
-        return await _ws_error(request, "invalid directory")
+        print(f"[ws] {peer} invalid dir or session limit: {dirname}")
+        return await _ws_error(request, "Invalid directory or session limit reached")
+
+    # Track this connection
+    await _ws_track_connect(peer)
 
     # Stale lock detection for this session
     if session.lock.locked():
@@ -535,6 +609,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             await asyncio.sleep(0.5)
         if session.lock.locked():
             print(f"[ws] {peer} {session.name} lock still held, forcing error")
+            await _ws_track_disconnect(peer)
             return await _ws_error(request, "Please wait, session still closing")
 
     # Ensure Claude is running for this session
@@ -542,6 +617,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         await _ensure_claude(session)
     except RuntimeError as e:
         print(f"[ws] {peer} {session.name} Claude start failed: {e}")
+        await _ws_track_disconnect(peer)
         return await _ws_error(request, str(e))
 
     ws = web.WebSocketResponse(heartbeat=45, compress=False)
@@ -606,6 +682,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         _remove_client(session, ws)
         session.client_sizes.pop(ws, None)
         await _apply_max_winsize(session)
+        await _ws_track_disconnect(peer)
         try:
             await ws.close()
         except Exception:

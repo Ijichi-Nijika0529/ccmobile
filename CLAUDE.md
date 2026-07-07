@@ -50,31 +50,50 @@ ssh 66.154.101.210 "sudo systemctl restart ccmobile && sudo systemctl status ccm
 ### 首次部署（新服务器/重装）
 
 ```bash
-# 1. 创建目录
-ssh 66.154.101.210 "sudo mkdir -p /opt/ccmobile"
+# 1. 创建 ccmobile 用户（如不存在）
+ssh 66.154.101.210 "sudo useradd -r -s /bin/bash -m ccmobile"
 
-# 2. 推送 server.py
+# 2. 创建目录并设置权限
+ssh 66.154.101.210 "sudo mkdir -p /opt/ccmobile && sudo chown ccmobile:ccmobile /opt/ccmobile"
+
+# 3. 推送 server.py
 ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
+ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/server.py"
 
-# 3. 安装依赖
+# 4. 安装依赖
 ssh 66.154.101.210 "sudo pip3 install aiohttp"
 
-# 4. 创建 .env（只做一次，密码不进仓库）
+# 5. 创建 .env（只做一次，密码不进仓库）
 ssh 66.154.101.210 "sudo tee /opt/ccmobile/.env" << 'EOF'
 CCMOBILE_PASSWORD=你的密码
 CCMOBILE_WORKDIR=/root/workspace
+CCMOBILE_CLAUDE_USER=yachiyo
 EOF
+ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/.env && sudo chmod 600 /opt/ccmobile/.env"
 
-# 5. 推送并安装 systemd 服务
+# 6. 配置 sudo 权限（让 ccmobile 能以 yachiyo 身份运行 claude）
+ssh 66.154.101.210 "sudo tee /etc/sudoers.d/ccmobile" < sudoers-ccmobile
+ssh 66.154.101.210 "sudo chmod 440 /etc/sudoers.d/ccmobile"
+
+# 7. 推送并安装 systemd 服务
 ssh 66.154.101.210 "sudo tee /etc/systemd/system/ccmobile.service" < ccmobile.service
 ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now ccmobile"
 ```
 
 - 生产地址：`http://66.154.101.210:8765`
 - SSH 用户：`yachiyo`（已配置在 `~/.ssh/config`，密钥 `id_ed25519`）
+- 服务用户：`ccmobile`（systemd 以此用户运行，通过 sudo 调用 claude）
 - 服务名：`ccmobile`（systemd 管理）
 - 部署路径：`/opt/ccmobile/server.py`
 - systemd service 文件：仓库中的 `ccmobile.service`
+- sudo 配置文件：仓库中的 `sudoers-ccmobile`
+
+**安全说明**：
+- ccmobile 服务以非特权用户 `ccmobile` 运行
+- Claude 进程通过 `sudo -u yachiyo claude` 以目标用户权限启动
+- 环境变量已白名单化，只保留安全变量（PATH/HOME/TERM/LANG/etc）
+- WebSocket 连接有速率限制：每 IP 最多 3 个并发连接，全局最多 5 个会话
+- 路径遍历防护：目录名强制只取最后一级，禁止 `../` 等路径操作
 
 ## server.py 代码导航
 
@@ -158,7 +177,8 @@ ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now 
 | `CCMOBILE_PASSWORD` | "" | 登录密码（空=开放模式） |
 | `CCMOBILE_WORKDIR` | $HOME | Claude Code 工作目录 |
 | `CCMOBILE_TOKEN_EXPIRE` | 86400 | Token 过期秒数 |
-| `CCMOBILE_ACCOUNTS` | "" | （预留）多账号配置，当前未实现，spawn 子进程前会从环境中清除 |
+| `CCMOBILE_CLAUDE_USER` | "" | 如设置，通过 `sudo -u <user> claude` 启动 Claude（用于权限隔离） |
+| `CCMOBILE_ACCOUNTS` | "" | （预留）多账号配置，当前未实现 |
 
 ## 关键实现细节
 
@@ -169,6 +189,12 @@ ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now 
 - 依赖：Python 3.10+（用了 `str | None` 类型注解语法）、aiohttp、系统需安装 `claude` CLI
 - **日志前缀约定**：所有 `print()` 使用 `[ccmobile]` / `[ws]` / `[login]` 前缀，新增日志应遵循此约定
 - `WS_MSG_MAX`（1MB）和 `WS_IDLE_TIMEOUT`（30min）当前为模块级硬编码常量，如需调整可直接修改 `server.py` 顶部常量区
+- **安全加固**：
+  - 环境变量白名单：子进程只保留 PATH/HOME/TERM/LANG/LC_ALL/USER/LOGNAME/SHELL，清除所有其他变量（防凭证泄漏）
+  - 路径遍历防护：`_get_or_create_session()` 强制只取目录名最后一级（`Path(dirname).name`），禁止 `../` 等路径操作
+  - WebSocket 速率限制：每 IP 最多 `WS_PER_IP_LIMIT`（3）个并发连接，全局最多 `MAX_SESSIONS`（5）个活跃会话
+  - 权限隔离：systemd 以非特权用户 `ccmobile` 运行服务，通过 `sudo -u` 以目标用户权限启动 Claude 子进程
+  - 僵尸进程防护：`kill_claude()` 用 `os.waitpid(pid, os.WNOHANG)` 正确回收子进程，防止僵尸堆积
 
 ## 待办 / 预留功能
 
