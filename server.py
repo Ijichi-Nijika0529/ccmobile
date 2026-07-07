@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import secrets
 import struct
 import termios
@@ -42,6 +43,18 @@ _rate_lock = asyncio.Lock()
 _ws_per_ip: dict[str, int] = {}
 _ws_per_ip_lock = asyncio.Lock()
 
+# Register rate limiting: {ip: [timestamps]}
+_register_rate_log: dict[str, list[float]] = {}
+_register_rate_lock = asyncio.Lock()
+REGISTER_RATE_LIMIT = 3
+REGISTER_RATE_WINDOW = 3600  # 1 hour
+
+# Password change rate limiting: {username: [timestamps]}
+_password_change_rate_log: dict[str, list[float]] = {}
+_password_change_rate_lock = asyncio.Lock()
+PASSWORD_CHANGE_RATE_LIMIT = 5
+PASSWORD_CHANGE_RATE_WINDOW = 3600
+
 
 # ── accounts (multi-user support) ───────────────────────────────────
 def _load_accounts() -> dict | None:
@@ -62,6 +75,32 @@ if _accounts:
     print(f"[ccmobile] Multi-account mode: {len(_accounts)} accounts loaded")
 else:
     print("[ccmobile] Single-password mode (no accounts.json found)")
+
+_accounts_lock = asyncio.Lock()
+
+
+async def _save_accounts(accounts: dict) -> None:
+    """Save accounts to accounts.json with atomic write."""
+    path = "/opt/ccmobile/accounts.json" if Path("/opt/ccmobile").exists() else "./accounts.json"
+    async with _accounts_lock:
+        # Write to temp file first
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(accounts, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # Atomic rename
+        os.replace(tmp_path, path)
+        # Update global _accounts
+        global _accounts
+        _accounts = accounts
+        print(f"[ccmobile] accounts.json updated, {len(accounts)} accounts")
+
+
+async def _reload_accounts() -> dict | None:
+    """Reload accounts from disk."""
+    async with _accounts_lock:
+        return _load_accounts()
 
 
 # ── token helpers ────────────────────────────────────────────────────
@@ -92,6 +131,30 @@ async def _check_rate(ip: str) -> bool:
             return False
         window.append(now)
         _rate_log[ip] = window
+        return True
+
+
+async def _check_register_rate(ip: str) -> bool:
+    """Check registration rate limit per IP."""
+    now = time.time()
+    async with _register_rate_lock:
+        window = [t for t in _register_rate_log.get(ip, []) if now - t < REGISTER_RATE_WINDOW]
+        if len(window) >= REGISTER_RATE_LIMIT:
+            return False
+        window.append(now)
+        _register_rate_log[ip] = window
+        return True
+
+
+async def _check_password_change_rate(username: str) -> bool:
+    """Check password change rate limit per user."""
+    now = time.time()
+    async with _password_change_rate_lock:
+        window = [t for t in _password_change_rate_log.get(username, []) if now - t < PASSWORD_CHANGE_RATE_WINDOW]
+        if len(window) >= PASSWORD_CHANGE_RATE_LIMIT:
+            return False
+        window.append(now)
+        _password_change_rate_log[username] = window
         return True
 
 
@@ -594,6 +657,119 @@ async def handle_auth_mode(request: web.Request) -> web.Response:
     return web.json_response({"mode": "multi" if _accounts else "single"})
 
 
+async def handle_register(request: web.Request) -> web.Response:
+    """User self-registration. POST /api/register
+    Body: {"username": "alice", "password": "...", "linux_user": "alice", "workdir": "/opt/workspace"}
+    """
+    peer = request.remote or "?"
+
+    # Only allow registration in multi-account mode
+    if not _accounts and _accounts is not None:
+        return web.json_response({"error": "registration disabled in single-password mode"}, status=403)
+
+    # Rate limiting (per IP, 3 per hour)
+    if not await _check_register_rate(peer):
+        print(f"[register] {peer} rate limited")
+        await asyncio.sleep(2)
+        return web.json_response({"error": "too many registrations"}, status=429)
+
+    try:
+        body = await request.json()
+        username = (body.get("username") or "").strip()
+        password = body.get("password", "")
+        linux_user = (body.get("linux_user") or username).strip()
+        workdir = (body.get("workdir") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400)
+
+    # Validate username
+    if not username or len(username) < 3 or len(username) > 20:
+        return web.json_response({"error": "username must be 3-20 characters"}, status=400)
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        return web.json_response({"error": "username can only contain letters, numbers, underscore"}, status=400)
+
+    # Validate password
+    if len(password) < 8:
+        return web.json_response({"error": "password must be at least 8 characters"}, status=400)
+
+    # Check if username exists
+    accounts = await _reload_accounts()
+    if not accounts:
+        accounts = {}
+    if username in accounts:
+        return web.json_response({"error": "username already exists"}, status=409)
+
+    # Generate password hash
+    salt = secrets.token_hex(8)
+    hash_value = hashlib.sha256((salt + password).encode()).hexdigest()
+    password_hash = f"sha256:{salt}:{hash_value}"
+
+    # Add to accounts
+    accounts[username] = {
+        "password_hash": password_hash,
+        "linux_user": linux_user,
+        "workdir": workdir if workdir else "/opt/workspace"
+    }
+
+    await _save_accounts(accounts)
+
+    print(f"[register] {peer} registered user: {username}, linux_user: {linux_user}, workdir: {accounts[username]['workdir']}")
+    return web.json_response({"ok": True, "username": username})
+
+
+async def handle_change_password(request: web.Request) -> web.Response:
+    """Change password for logged-in user. POST /api/change-password
+    Body: {"old_password": "...", "new_password": "..."}
+    """
+    token = _get_token(request)
+    username = check_token(token)
+    if not username:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    # Only allow in multi-account mode
+    if not _accounts:
+        return web.json_response({"error": "password change disabled in single-password mode"}, status=403)
+
+    # Rate limiting (per user, 5 per hour)
+    if not await _check_password_change_rate(username):
+        print(f"[password] {username} rate limited")
+        await asyncio.sleep(2)
+        return web.json_response({"error": "too many password changes"}, status=429)
+
+    try:
+        body = await request.json()
+        old_password = body.get("old_password", "")
+        new_password = body.get("new_password", "")
+    except (json.JSONDecodeError, AttributeError):
+        return web.json_response({"error": "bad request"}, status=400)
+
+    # Validate new password
+    if len(new_password) < 8:
+        return web.json_response({"error": "password must be at least 8 characters"}, status=400)
+
+    # Verify old password
+    accounts = await _reload_accounts()
+    if not accounts or username not in accounts:
+        return web.json_response({"error": "user not found"}, status=404)
+
+    account = accounts[username]
+    if not _verify_password(old_password, account["password_hash"]):
+        await asyncio.sleep(1)
+        return web.json_response({"error": "wrong old password"}, status=403)
+
+    # Generate new password hash
+    salt = secrets.token_hex(8)
+    hash_value = hashlib.sha256((salt + new_password).encode()).hexdigest()
+    password_hash = f"sha256:{salt}:{hash_value}"
+
+    # Update accounts
+    accounts[username]["password_hash"] = password_hash
+    await _save_accounts(accounts)
+
+    print(f"[password] {username} changed password")
+    return web.json_response({"ok": True})
+
+
 async def handle_dirs(request: web.Request) -> web.Response:
     """List workdir + direct subdirectories with running status.
     In multi-account mode, returns user's workdir. In single-password mode, returns WORKDIR."""
@@ -834,6 +1010,8 @@ app.router.add_get("/", handle_index)
 app.router.add_post("/login", handle_login)
 app.router.add_get("/check", handle_check)
 app.router.add_get("/api/auth-mode", handle_auth_mode)
+app.router.add_post("/api/register", handle_register)
+app.router.add_post("/api/change-password", handle_change_password)
 app.router.add_get("/api/dirs", handle_dirs)
 app.router.add_post("/api/mkdir", handle_mkdir)
 app.router.add_get("/ws", handle_ws)
@@ -933,7 +1111,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
   <input id="username-input" type="text" placeholder="Username" enterkeyhint="next" autocomplete="username" style="display:none">
   <input id="pw-input" type="password" placeholder="Password" enterkeyhint="go" autocomplete="current-password">
   <button id="login-btn">Connect</button>
+  <div style="margin-top:12px">
+    <a href="#" id="register-link" style="color:var(--accent);font-size:13px;display:none">注册新账号</a>
+  </div>
   <span id="login-error"></span>
+
+  <!-- 注册表单 -->
+  <div id="register-form" style="display:none">
+    <h2>注册新账号</h2>
+    <input id="reg-username" type="text" placeholder="Username (3-20字符)" enterkeyhint="next" autocomplete="off">
+    <input id="reg-password" type="password" placeholder="Password (最少8字符)" enterkeyhint="next" autocomplete="new-password">
+    <input id="reg-password2" type="password" placeholder="Confirm Password" enterkeyhint="go" autocomplete="new-password">
+    <button id="register-btn">注册</button>
+    <div style="margin-top:12px">
+      <a href="#" id="back-login-link" style="color:var(--accent);font-size:13px">返回登录</a>
+    </div>
+    <span id="register-error"></span>
+  </div>
 </div>
 
 <div id="main-screen">
@@ -942,7 +1136,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
       <span id="status-dot"></span>
       <span id="status-text">offline</span>
     </div>
-    <button id="logout-btn">Logout</button>
+    <div>
+      <button id="change-password-btn" style="display:none;margin-right:8px">修改密码</button>
+      <button id="logout-btn">Logout</button>
+    </div>
   </div>
   <div id="terminal-container">
     <div id="start-overlay">
@@ -998,6 +1195,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;c
     <button id="send-btn">Send</button>
   </div>
   <div id="debug-panel"></div>
+
+  <!-- 修改密码模态框 -->
+  <div id="change-password-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;justify-content:center;align-items:center">
+    <div style="background:var(--surface);padding:24px;border-radius:12px;width:90%;max-width:360px;box-shadow:0 4px 20px rgba(0,0,0,0.3)">
+      <h3 style="margin:0 0 16px;color:var(--text)">修改密码</h3>
+      <input id="old-password-input" type="password" placeholder="旧密码" style="width:100%;padding:10px;margin-bottom:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+      <input id="new-password-input" type="password" placeholder="新密码 (最少8字符)" style="width:100%;padding:10px;margin-bottom:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+      <input id="new-password2-input" type="password" placeholder="确认新密码" style="width:100%;padding:10px;margin-bottom:16px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px">
+      <div style="display:flex;gap:8px">
+        <button id="confirm-change-password-btn" style="flex:1;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">确认</button>
+        <button id="cancel-change-password-btn" style="flex:1;padding:10px;background:var(--border);color:var(--text);border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">取消</button>
+      </div>
+      <span id="change-password-error" style="display:block;margin-top:12px;color:var(--danger);font-size:13px"></span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1021,7 +1233,12 @@ let currentUser = null;
 const $ = id => document.getElementById(id);
 const loginScreen = $('login-screen'), mainScreen = $('main-screen');
 const usernameInput = $('username-input'), pwInput = $('pw-input'), loginBtn = $('login-btn'), loginError = $('login-error');
+const registerLink = $('register-link'), registerForm = $('register-form'), backLoginLink = $('back-login-link');
+const regUsername = $('reg-username'), regPassword = $('reg-password'), regPassword2 = $('reg-password2'), registerBtn = $('register-btn'), registerError = $('register-error');
 const statusDot = $('status-dot'), statusText = $('status-text');
+const changePasswordBtn = $('change-password-btn');
+const changePasswordModal = $('change-password-modal'), oldPasswordInput = $('old-password-input'), newPasswordInput = $('new-password-input'), newPassword2Input = $('new-password2-input');
+const confirmChangePasswordBtn = $('confirm-change-password-btn'), cancelChangePasswordBtn = $('cancel-change-password-btn'), changePasswordError = $('change-password-error');
 const terminalContainer = $('terminal-container');
 const startOverlay = $('start-overlay'), startBtn = $('start-btn');
 const dirList = $('dir-list'), dirNewInput = $('dir-new-input'), dirNewBtn = $('dir-new-btn');
@@ -1039,6 +1256,7 @@ async function checkAuthMode() {
       usernameInput.placeholder = 'Username';
       pwInput.setAttribute('enterkeyhint', 'go');
       usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') pwInput.focus(); });
+      registerLink.style.display = 'inline';
     }
   } catch (e) {
     log('AUTH', 'checkAuthMode failed: ' + e.message);
@@ -1093,6 +1311,135 @@ async function doLogin() {
 
 pwInput.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 loginBtn.addEventListener('click', doLogin);
+
+// Register form
+registerLink.addEventListener('click', e => {
+  e.preventDefault();
+  pwInput.value = '';
+  usernameInput.value = '';
+  loginError.textContent = '';
+  loginScreen.querySelector('h1').style.display = 'none';
+  usernameInput.style.display = 'none';
+  pwInput.style.display = 'none';
+  loginBtn.style.display = 'none';
+  registerLink.parentElement.style.display = 'none';
+  loginError.style.display = 'none';
+  registerForm.style.display = 'block';
+});
+
+backLoginLink.addEventListener('click', e => {
+  e.preventDefault();
+  regUsername.value = '';
+  regPassword.value = '';
+  regPassword2.value = '';
+  registerError.textContent = '';
+  registerForm.style.display = 'none';
+  loginScreen.querySelector('h1').style.display = 'block';
+  if (authMode === 'multi') usernameInput.style.display = 'block';
+  pwInput.style.display = 'block';
+  loginBtn.style.display = 'block';
+  registerLink.parentElement.style.display = 'block';
+  loginError.style.display = 'block';
+});
+
+async function doRegister() {
+  registerError.textContent = '';
+  const username = regUsername.value.trim();
+  const pw1 = regPassword.value;
+  const pw2 = regPassword2.value;
+
+  if (!username) {
+    registerError.textContent = 'Username required';
+    return;
+  }
+  if (pw1.length < 8) {
+    registerError.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+  if (pw1 !== pw2) {
+    registerError.textContent = 'Passwords do not match';
+    return;
+  }
+
+  try {
+    log('REGISTER', 'registering: ' + username);
+    const res = await fetch('/api/register', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: username, password: pw1, linux_user: username})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      log('REGISTER', 'success: ' + username);
+      alert('注册成功！请使用新账号登录。\n\n注意：管理员需先创建 Linux 用户才能使用。');
+      backLoginLink.click();
+      usernameInput.value = username;
+      pwInput.value = pw1;
+    } else {
+      registerError.textContent = data.error || 'Registration failed';
+      log('REGISTER', 'FAIL: ' + (data.error || 'unknown'));
+    }
+  } catch (e) {
+    registerError.textContent = e.message;
+    log('REGISTER', 'FAIL: ' + e.message);
+  }
+}
+
+regPassword2.addEventListener('keydown', e => { if (e.key === 'Enter') doRegister(); });
+registerBtn.addEventListener('click', doRegister);
+
+// Change password
+changePasswordBtn.addEventListener('click', () => {
+  oldPasswordInput.value = '';
+  newPasswordInput.value = '';
+  newPassword2Input.value = '';
+  changePasswordError.textContent = '';
+  changePasswordModal.style.display = 'flex';
+});
+
+cancelChangePasswordBtn.addEventListener('click', () => {
+  changePasswordModal.style.display = 'none';
+});
+
+async function doChangePassword() {
+  changePasswordError.textContent = '';
+  const oldPw = oldPasswordInput.value;
+  const newPw1 = newPasswordInput.value;
+  const newPw2 = newPassword2Input.value;
+
+  if (newPw1.length < 8) {
+    changePasswordError.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+  if (newPw1 !== newPw2) {
+    changePasswordError.textContent = 'Passwords do not match';
+    return;
+  }
+
+  try {
+    log('PASSWORD', 'changing password');
+    const res = await fetch('/api/change-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old_password: oldPw, new_password: newPw1})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      log('PASSWORD', 'success');
+      alert('密码修改成功！');
+      changePasswordModal.style.display = 'none';
+    } else {
+      changePasswordError.textContent = data.error || 'Password change failed';
+      log('PASSWORD', 'FAIL: ' + (data.error || 'unknown'));
+    }
+  } catch (e) {
+    changePasswordError.textContent = e.message;
+    log('PASSWORD', 'FAIL: ' + e.message);
+  }
+}
+
+newPassword2Input.addEventListener('keydown', e => { if (e.key === 'Enter') doChangePassword(); });
+confirmChangePasswordBtn.addEventListener('click', doChangePassword);
 
 function initTerminal() {
   log('TERM', 'initializing xterm.js...');
@@ -1541,6 +1888,7 @@ function showMain() {
   // Update status text with username in multi-account mode
   if (currentUser) {
     statusText.textContent = 'User: ' + currentUser;
+    changePasswordBtn.style.display = 'inline-block';
   }
   log('UI', 'main screen shown' + (currentUser ? ', user=' + currentUser : ''));
 }
