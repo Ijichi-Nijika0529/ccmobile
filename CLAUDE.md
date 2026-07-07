@@ -6,7 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ccmobile — 轻量级手机端 Claude Code 远程控制工具。整个应用是一个自包含的 Python 文件 `server.py`，后端用 aiohttp 提供 Web 服务和 WebSocket，前端用 xterm.js 嵌入在同一个文件里渲染终端。
 
-同目录下还有一个 `ssh_run.py`（在上级目录 `D:\VPS\`），用于通过 Paramiko SSH 远程初始化 VPS（安装依赖、创建 swap 等），是一次性工具，不是 ccmobile 本身的一部分。
+## 功能
+- 移动端 Web 终端（xterm.js）
+- 多账号认证系统 + Token 会话
+- Web 端用户注册与密码管理
+- PTY 桥接 Claude Code CLI
+- 多工作目录，每个目录独立 Claude 进程
+- 虚拟键盘（Ctrl/Alt 修饰键、QWERTY、特殊键、CLI 符号）
+- 调试面板
 
 ## 开发须知
 
@@ -50,50 +57,78 @@ ssh 66.154.101.210 "sudo systemctl restart ccmobile && sudo systemctl status ccm
 ### 首次部署（新服务器/重装）
 
 ```bash
-# 1. 创建 ccmobile 用户（如不存在）
+# 1. 创建 ccmobile 服务用户
 ssh 66.154.101.210 "sudo useradd -r -s /bin/bash -m ccmobile"
 
-# 2. 创建目录并设置权限
+# 2. 创建普通用户（用于运行 Claude）
+ssh 66.154.101.210 "sudo useradd -m -s /bin/bash -G ccmobile-users yachiyo"
+
+# 3. 配置共享 workspace（可选，如需多用户协作）
+ssh 66.154.101.210 "sudo groupadd ccmobile-users"
+ssh 66.154.101.210 "sudo mkdir -p /opt/workspace"
+ssh 66.154.101.210 "sudo chown root:ccmobile-users /opt/workspace"
+ssh 66.154.101.210 "sudo chmod 775 /opt/workspace"
+ssh 66.154.101.210 "sudo chmod g+s /opt/workspace"
+
+# 4. 创建部署目录
 ssh 66.154.101.210 "sudo mkdir -p /opt/ccmobile && sudo chown ccmobile:ccmobile /opt/ccmobile"
 
-# 3. 推送 server.py
+# 5. 推送 server.py
 ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
 ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/server.py"
 
-# 4. 安装依赖
+# 6. 安装依赖
 ssh 66.154.101.210 "sudo pip3 install aiohttp"
 
-# 5. 创建 .env（只做一次，密码不进仓库）
-ssh 66.154.101.210 "sudo tee /opt/ccmobile/.env" << 'EOF'
-CCMOBILE_PASSWORD=你的密码
-CCMOBILE_WORKDIR=/root/workspace
-CCMOBILE_CLAUDE_USER=yachiyo
+# 7. 创建 accounts.json（多账号模式）
+ssh 66.154.101.210 'sudo tee /opt/ccmobile/accounts.json' << 'EOF'
+{
+  "yachiyo": {
+    "password_hash": "sha256:salt:hash",
+    "linux_user": "yachiyo",
+    "workdir": "/root/workspace"
+  }
+}
 EOF
-ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/.env && sudo chmod 600 /opt/ccmobile/.env"
+ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/accounts.json && sudo chmod 600 /opt/ccmobile/accounts.json"
 
-# 6. 配置 sudo 权限（让 ccmobile 能以 yachiyo 身份运行 claude）
+# 8. 配置 sudo 权限（让 ccmobile 能以其他用户身份运行 claude）
 ssh 66.154.101.210 "sudo tee /etc/sudoers.d/ccmobile" < sudoers-ccmobile
 ssh 66.154.101.210 "sudo chmod 440 /etc/sudoers.d/ccmobile"
 
-# 7. 推送并安装 systemd 服务
+# 9. 迁移 Claude 配置（如有现有配置）
+ssh 66.154.101.210 "sudo cp -r /root/.claude /home/yachiyo/ && sudo cp /root/.claude.json /home/yachiyo/"
+ssh 66.154.101.210 "sudo chown -R yachiyo:yachiyo /home/yachiyo/.claude*"
+
+# 10. 配置工作目录权限
+ssh 66.154.101.210 "sudo chown -R yachiyo:yachiyo /root/workspace"
+ssh 66.154.101.210 "sudo chmod o+x /root"  # 允许 yachiyo 遍历 /root 访问 workspace
+
+# 11. 推送并安装 systemd 服务
 ssh 66.154.101.210 "sudo tee /etc/systemd/system/ccmobile.service" < ccmobile.service
 ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now ccmobile"
 ```
 
-- 生产地址：`http://66.154.101.210:8765`
+- 生产地址：`https://66.154.101.210:8765`（自签名 HTTPS）
 - SSH 用户：`yachiyo`（已配置在 `~/.ssh/config`，密钥 `id_ed25519`）
 - 服务用户：`ccmobile`（systemd 以此用户运行，通过 sudo 调用 claude）
+- Claude 运行用户：由 accounts.json 中 `linux_user` 字段指定
 - 服务名：`ccmobile`（systemd 管理）
 - 部署路径：`/opt/ccmobile/server.py`
+- 账号配置：`/opt/ccmobile/accounts.json`（权限 600）
 - systemd service 文件：仓库中的 `ccmobile.service`
 - sudo 配置文件：仓库中的 `sudoers-ccmobile`
 
 **安全说明**：
 - ccmobile 服务以非特权用户 `ccmobile` 运行
-- Claude 进程通过 `sudo -u yachiyo claude` 以目标用户权限启动
+- Claude 进程通过 `sudo -u <linux_user> claude` 以账号对应的用户权限启动
 - 环境变量已白名单化，只保留安全变量（PATH/HOME/TERM/LANG/etc）
 - WebSocket 连接有速率限制：每 IP 最多 3 个并发连接，全局最多 5 个会话
 - 路径遍历防护：目录名强制只取最后一级，禁止 `../` 等路径操作
+- 登录速率限制：每 IP 每分钟最多 5 次
+- 注册速率限制：每 IP 每小时最多 3 次
+- 密码修改速率限制：每用户每小时最多 5 次
+- accounts.json 并发安全：asyncio.Lock + 原子写入
 
 ## server.py 代码导航
 
@@ -212,9 +247,15 @@ ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now 
 
 - `password_hash`：格式 `sha256:salt:hash`，其中 `hash = sha256(salt + password)`
 - `linux_user`：对应的 Linux 用户名（Claude 进程以此用户身份运行）
-- `workdir`：可选，默认为 `/home/<linux_user>/workspace`
+- `workdir`：默认工作目录，可选
 
-生成密码哈希：
+**权限**：
+```bash
+sudo chown ccmobile:ccmobile /opt/ccmobile/accounts.json
+sudo chmod 600 /opt/ccmobile/accounts.json
+```
+
+**生成密码哈希**：
 ```bash
 python3 -c "
 import hashlib, secrets
@@ -225,10 +266,19 @@ print(f'sha256:{salt}:{hash_value}')
 "
 ```
 
-或使用内置工具（仅 Linux）：
-```bash
-python3 server.py hash-password
-```
+**Web 端注册**：
+- 访问登录页面，点击"注册新账号"
+- 填写 username、password
+- 提交后 accounts.json 自动更新
+- **注意**：管理员需先创建对应的 Linux 用户：
+  ```bash
+  sudo useradd -m -s /bin/bash -G ccmobile-users newuser
+  ```
+
+**修改密码**：
+- 登录后点击"修改密码"按钮
+- 输入旧密码和新密码
+- 提交后 accounts.json 自动更新
 
 ## 关键实现细节
 
@@ -245,6 +295,12 @@ python3 server.py hash-password
   - Session 包含 `linux_user` 字段，spawn_claude 时用 `sudo -u <linux_user> claude`
   - handle_dirs/handle_mkdir 根据 token 中的 username 返回对应用户的 workdir
   - 前端调用 `/api/auth-mode` 检测模式，动态显示登录表单
+- **用户注册与密码管理**：
+  - `/api/register`：Web 端自助注册，写入 accounts.json
+  - `/api/change-password`：已登录用户修改密码
+  - `_save_accounts()`：asyncio.Lock + 原子写入（临时文件 + os.replace）
+  - 速率限制：注册 3 次/小时/IP，修改密码 5 次/小时/用户
+  - 注册后需管理员手动创建 Linux 用户
 - **安全加固**：
   - 环境变量白名单：子进程只保留 PATH/HOME/TERM/LANG/LC_ALL/USER/LOGNAME/SHELL，清除所有其他变量（防凭证泄漏）
   - 路径遍历防护：`_get_or_create_session()` 强制只取目录名最后一级（`Path(dirname).name`），禁止 `../` 等路径操作
