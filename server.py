@@ -476,6 +476,12 @@ async def handle_login(request: web.Request) -> web.Response:
         await asyncio.sleep(2)
         return web.json_response({"error": "too many attempts"}, status=429)
 
+    # Detect if connection is via HTTPS (direct or behind proxy)
+    is_https = (
+        request.scheme == "https" or
+        request.headers.get("X-Forwarded-Proto") == "https"
+    )
+
     if not PASSWORD:
         token = make_token()
         resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
@@ -491,7 +497,7 @@ async def handle_login(request: web.Request) -> web.Response:
         token = make_token()
         resp = web.json_response({"token": token, "expires": TOKEN_EXPIRE})
     resp.set_cookie("ccmobile_token", token, max_age=TOKEN_EXPIRE,
-                    httponly=True, samesite="Strict", secure=False)
+                    httponly=True, samesite="Strict", secure=is_https)
     return resp
 
 
@@ -1383,12 +1389,28 @@ function showMain() {
 
 
 def main():
+    # Try to load self-signed SSL certificate if available
+    ssl_context = None
+    cert_path = Path("/opt/ccmobile/selfsigned.crt")
+    key_path = Path("/opt/ccmobile/selfsigned.key")
+
+    if cert_path.exists() and key_path.exists():
+        try:
+            import ssl
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(str(cert_path), str(key_path))
+            print(f"[ccmobile] HTTPS enabled (self-signed certificate)")
+        except Exception as e:
+            print(f"[ccmobile] WARNING: failed to load SSL cert: {e}")
+            ssl_context = None
+
     if PASSWORD:
-        print(f"[ccmobile] auth enabled, listening on :{PORT}")
+        scheme = "https" if ssl_context else "http"
+        print(f"[ccmobile] auth enabled, listening on {scheme}://0.0.0.0:{PORT}")
     else:
         print(f"[ccmobile] WARNING: no password set — open access on :{PORT}")
     print(f"[ccmobile] workdir: {WORKDIR}")
-    web.run_app(app, host="0.0.0.0", port=PORT, print=lambda *_: None)
+    web.run_app(app, host="0.0.0.0", port=PORT, ssl_context=ssl_context, print=lambda *_: None)
 
 
 if __name__ == "__main__":
