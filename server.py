@@ -1940,11 +1940,12 @@ function showMain() {
   if (!term) initTerminal();
   startOverlay.style.display = 'flex';
   if (!dirsLoaded) loadDirs();
-  // Update status text with username in multi-account mode
+  // Update status text and show change password button
   if (currentUser) {
     statusText.textContent = 'User: ' + currentUser;
-    changePasswordBtn.style.display = 'inline-block';
   }
+  // Show change password button in both modes
+  changePasswordBtn.style.display = 'inline-block';
   log('UI', 'main screen shown' + (currentUser ? ', user=' + currentUser : ''));
 }
 
