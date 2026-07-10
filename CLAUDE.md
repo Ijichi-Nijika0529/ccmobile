@@ -21,7 +21,7 @@ ccmobile — 轻量级手机端 Claude Code 远程控制工具。整个应用是
 - **无 lint/格式化配置**：纯 Python 脚本，无 CI/CD。
 - **依赖极简**：仅需 `aiohttp`（无 requirements.txt，直接 `pip3 install aiohttp`）。
 - **Python 3.10+**（代码中使用了 `str | None` 类型注解语法）。
-- **每次代码修改后必须部署到生产服务器**：push server.py 并 restart systemd 服务（部署命令见下方"日常部署"）。
+- **每次代码修改后必须部署到生产服务器**：push server.py 并 restart systemd 服务（部署命令见 `/deploy` 技能）。
 
 ## 运行与部署
 
@@ -42,72 +42,7 @@ systemd 部署文件 `ccmobile.service` 已在仓库中，可直接使用。
 
 ### 生产部署
 
-### 日常部署（代码更新后）
-
-`/opt/ccmobile/` 为 root 所有，yachiyo 不能直接 scp，通过 `sudo tee` 管道写入：
-
-```bash
-# 1. 推送 server.py 到服务器（在 ccmobile/ 目录下执行）
-ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
-
-# 2. 重启服务并查看状态
-ssh 66.154.101.210 "sudo systemctl restart ccmobile && sudo systemctl status ccmobile --no-pager"
-```
-
-### 首次部署（新服务器/重装）
-
-```bash
-# 1. 创建 ccmobile 服务用户
-ssh 66.154.101.210 "sudo useradd -r -s /bin/bash -m ccmobile"
-
-# 2. 创建普通用户（用于运行 Claude）
-ssh 66.154.101.210 "sudo useradd -m -s /bin/bash -G ccmobile-users yachiyo"
-
-# 3. 配置共享 workspace（可选，如需多用户协作）
-ssh 66.154.101.210 "sudo groupadd ccmobile-users"
-ssh 66.154.101.210 "sudo mkdir -p /opt/workspace"
-ssh 66.154.101.210 "sudo chown root:ccmobile-users /opt/workspace"
-ssh 66.154.101.210 "sudo chmod 775 /opt/workspace"
-ssh 66.154.101.210 "sudo chmod g+s /opt/workspace"
-
-# 4. 创建部署目录
-ssh 66.154.101.210 "sudo mkdir -p /opt/ccmobile && sudo chown ccmobile:ccmobile /opt/ccmobile"
-
-# 5. 推送 server.py
-ssh 66.154.101.210 "sudo tee /opt/ccmobile/server.py" < server.py
-ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/server.py"
-
-# 6. 安装依赖
-ssh 66.154.101.210 "sudo pip3 install aiohttp"
-
-# 7. 创建 accounts.json（多账号模式）
-ssh 66.154.101.210 'sudo tee /opt/ccmobile/accounts.json' << 'EOF'
-{
-  "yachiyo": {
-    "password_hash": "sha256:salt:hash",
-    "linux_user": "yachiyo",
-    "workdir": "/root/workspace"
-  }
-}
-EOF
-ssh 66.154.101.210 "sudo chown ccmobile:ccmobile /opt/ccmobile/accounts.json && sudo chmod 600 /opt/ccmobile/accounts.json"
-
-# 8. 配置 sudo 权限（让 ccmobile 能以其他用户身份运行 claude）
-ssh 66.154.101.210 "sudo tee /etc/sudoers.d/ccmobile" < sudoers-ccmobile
-ssh 66.154.101.210 "sudo chmod 440 /etc/sudoers.d/ccmobile"
-
-# 9. 迁移 Claude 配置（如有现有配置）
-ssh 66.154.101.210 "sudo cp -r /root/.claude /home/yachiyo/ && sudo cp /root/.claude.json /home/yachiyo/"
-ssh 66.154.101.210 "sudo chown -R yachiyo:yachiyo /home/yachiyo/.claude*"
-
-# 10. 配置工作目录权限
-ssh 66.154.101.210 "sudo chown -R yachiyo:yachiyo /root/workspace"
-ssh 66.154.101.210 "sudo chmod o+x /root"  # 允许 yachiyo 遍历 /root 访问 workspace
-
-# 11. 推送并安装 systemd 服务
-ssh 66.154.101.210 "sudo tee /etc/systemd/system/ccmobile.service" < ccmobile.service
-ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now ccmobile"
-```
+部署命令已迁移到 `/deploy` 技能（`.claude/skills/deploy/SKILL.md`），包含日常部署和首次部署完整流程。
 
 - 生产地址：`https://66.154.101.210:8765`（自签名 HTTPS）
 - SSH 用户：`yachiyo`（已配置在 `~/.ssh/config`，密钥 `id_ed25519`）
@@ -129,28 +64,6 @@ ssh 66.154.101.210 "sudo systemctl daemon-reload && sudo systemctl enable --now 
 - 注册速率限制：每 IP 每小时最多 3 次
 - 密码修改速率限制：每用户每小时最多 5 次
 - accounts.json 并发安全：asyncio.Lock + 原子写入
-
-## server.py 代码导航
-
-`server.py` 约 1050 行，用 `──` 注释分隔段落。按行号快速定位：
-
-| 行号（约） | 段落标记 | 内容 |
-|---|---|---|
-| 1-16 | imports | 标准库 + aiohttp |
-| 20-35 | `── config` | 环境变量读取、常量、`_secret` 生成、速率限制器 |
-| 40-70 | `── token helpers` | `_hash_token()` / `make_token()` / `check_token()` / `_check_rate()` |
-| 73-83 | `── Claude Code process manager` | 全局状态变量（`_claude_pid`, `_claude_fd`, `_ws_clients`, `_pty_ring` 等） |
-| 86-100 | `_safe()` / `_ws_error()` | 工具函数 |
-| 103-113 | `── client registry` | `_add_client()` / `_remove_client()` |
-| 115-153 | `── PTY write helper` | `_pty_write()` — 非阻塞写入，BlockingIOError 用 add_writer 重试 |
-| 156-185 | `── PTY window size` | `_set_winsize()` / `_apply_max_winsize()` — 多客户端取 max |
-| 187-285 | `── broadcast helpers` | `_broadcast_pty()`（唯一 PTY 读协程）、`_cleanup_after_exit()` |
-| 288-358 | `── Claude lifecycle` | `spawn_claude()` / `_ensure_claude()` / `kill_claude()` |
-| 361-416 | `── HTTP handlers` | `handle_index()` / `handle_login()` / `handle_check()` |
-| 418-527 | `── WebSocket handler` | `handle_ws()` — 鉴权→spawn→重放→消息循环 |
-| 530-538 | `── app` | `web.Application` 路由绑定 |
-| 539-1038 | `── embedded frontend` | `INDEX_HTML` 模板字符串（CSS + HTML + JS），内含 `// ── virtual keyboard ──` 子标记（行 934） |
-| 1041-1051 | `main()` | 入口 |
 
 ## 架构核心
 
