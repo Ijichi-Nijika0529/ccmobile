@@ -720,21 +720,13 @@ async def handle_register(request: web.Request) -> web.Response:
 async def handle_change_password(request: web.Request) -> web.Response:
     """Change password for logged-in user. POST /api/change-password
     Body: {"old_password": "...", "new_password": "..."}
+    Supports both multi-account and single-password modes.
     """
+    peer = request.remote or "?"
     token = _get_token(request)
     username = check_token(token)
-    if not username:
+    if username is None:
         return web.json_response({"error": "unauthorized"}, status=401)
-
-    # Only allow in multi-account mode
-    if not _accounts:
-        return web.json_response({"error": "password change disabled in single-password mode"}, status=403)
-
-    # Rate limiting (per user, 5 per hour)
-    if not await _check_password_change_rate(username):
-        print(f"[password] {username} rate limited")
-        await asyncio.sleep(2)
-        return web.json_response({"error": "too many password changes"}, status=429)
 
     try:
         body = await request.json()
@@ -747,27 +739,90 @@ async def handle_change_password(request: web.Request) -> web.Response:
     if len(new_password) < 8:
         return web.json_response({"error": "password must be at least 8 characters"}, status=400)
 
-    # Verify old password
-    accounts = await _reload_accounts()
-    if not accounts or username not in accounts:
-        return web.json_response({"error": "user not found"}, status=404)
+    # Multi-account mode
+    if _accounts:
+        if not username:
+            return web.json_response({"error": "username required"}, status=400)
 
-    account = accounts[username]
-    if not _verify_password(old_password, account["password_hash"]):
-        await asyncio.sleep(1)
-        return web.json_response({"error": "wrong old password"}, status=403)
+        # Rate limiting (per user, 5 per hour)
+        if not await _check_password_change_rate(username):
+            print(f"[password] {username} rate limited")
+            await asyncio.sleep(2)
+            return web.json_response({"error": "too many password changes"}, status=429)
 
-    # Generate new password hash
-    salt = secrets.token_hex(8)
-    hash_value = hashlib.sha256((salt + new_password).encode()).hexdigest()
-    password_hash = f"sha256:{salt}:{hash_value}"
+        # Verify old password
+        accounts = await _reload_accounts()
+        if not accounts or username not in accounts:
+            return web.json_response({"error": "user not found"}, status=404)
 
-    # Update accounts
-    accounts[username]["password_hash"] = password_hash
-    await _save_accounts(accounts)
+        account = accounts[username]
+        if not _verify_password(old_password, account["password_hash"]):
+            await asyncio.sleep(1)
+            return web.json_response({"error": "wrong old password"}, status=403)
 
-    print(f"[password] {username} changed password")
-    return web.json_response({"ok": True})
+        # Generate new password hash
+        salt = secrets.token_hex(8)
+        hash_value = hashlib.sha256((salt + new_password).encode()).hexdigest()
+        password_hash = f"sha256:{salt}:{hash_value}"
+
+        # Update accounts
+        accounts[username]["password_hash"] = password_hash
+        await _save_accounts(accounts)
+
+        print(f"[password] {username} changed password")
+        return web.json_response({"ok": True})
+
+    # Single-password mode
+    else:
+        global PASSWORD  # Declare at the beginning
+
+        # Rate limiting (per IP, 5 per hour)
+        if not await _check_password_change_rate(peer):
+            print(f"[password] {peer} rate limited")
+            await asyncio.sleep(2)
+            return web.json_response({"error": "too many password changes"}, status=429)
+
+        # Verify old password
+        if not PASSWORD or not secrets.compare_digest(old_password, PASSWORD):
+            await asyncio.sleep(1)
+            return web.json_response({"error": "wrong old password"}, status=403)
+
+        # Update .env file
+        env_path = "/opt/ccmobile/.env" if Path("/opt/ccmobile/.env").exists() else ".env"
+
+        try:
+            # Read current .env
+            env_lines = []
+            password_found = False
+            with open(env_path, "r") as f:
+                for line in f:
+                    if line.startswith("CCMOBILE_PASSWORD="):
+                        env_lines.append(f"CCMOBILE_PASSWORD={new_password}\n")
+                        password_found = True
+                    else:
+                        env_lines.append(line)
+
+            # If password line not found, append it
+            if not password_found:
+                env_lines.append(f"CCMOBILE_PASSWORD={new_password}\n")
+
+            # Write back atomically
+            tmp_path = env_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                f.writelines(env_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, env_path)
+
+            # Update global PASSWORD variable
+            PASSWORD = new_password
+
+            print(f"[password] {peer} changed password (single-password mode)")
+            return web.json_response({"ok": True, "restart_required": True})
+
+        except OSError as e:
+            print(f"[password] {peer} failed to update .env: {e}")
+            return web.json_response({"error": "failed to update password file"}, status=500)
 
 
 async def handle_dirs(request: web.Request) -> web.Response:
